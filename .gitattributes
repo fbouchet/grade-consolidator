@@ -1,0 +1,16 @@
+# Ensure consistent line endings across platforms
+* text=auto
+
+# Force LF for source files
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+
+# Binary files
+*.xlsx binary
+*.ods binary
+*.pdf binary

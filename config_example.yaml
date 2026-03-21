@@ -1,0 +1,12 @@
+# consolidate_grades configuration
+# ---------------------------------
+# Paths are relative to this config file's directory.
+
+master_file: "master.csv"
+
+grade_files:
+  - "group1_grades.csv"
+  - "group2_grades.xlsx"
+  - "group3_grades.ods"
+
+output_file: "grades_consolidated.csv"
