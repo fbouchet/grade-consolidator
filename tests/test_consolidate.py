@@ -28,6 +28,7 @@ from consolidate_grades.consolidate import (
     parse_grade,
     process_ta_file,
     promote_header_row,
+    prompt_column_choice,
     read_file,
     resolve_grade_files,
     write_moodle_csv,
@@ -231,7 +232,7 @@ class TestDetectColumn:
 class TestDetectGradeColumn:
     def test_by_name(self):
         df = pd.DataFrame({"ID": ["1"], "Note": ["15"]})
-        col, warnings = detect_grade_column(df, {"ID"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"ID"})
         assert col == "Note"
         assert len(warnings) == 0
 
@@ -239,7 +240,7 @@ class TestDetectGradeColumn:
         df = pd.DataFrame(
             {"ID": ["1", "2"], "Nom": ["A", "B"], "Mystery": ["14,5", "ABS"]}
         )
-        col, warnings = detect_grade_column(df, {"ID", "Nom"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"ID", "Nom"})
         assert col == "Mystery"
         assert any("auto-detected" in w for w in warnings)
 
@@ -251,34 +252,34 @@ class TestDetectGradeColumn:
                 "Col_B": ["10", "12"],
             }
         )
-        col, warnings = detect_grade_column(df, {"ID"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"ID"})
         assert col is None
         assert any("AMBIGUOUS" in w for w in warnings)
 
     def test_no_grade_column(self):
         df = pd.DataFrame({"ID": ["1"], "Nom": ["A"], "Adresse": ["1 rue X"]})
-        col, warnings = detect_grade_column(df, {"ID", "Nom"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"ID", "Nom"})
         assert col is None
         assert any("No grade column" in w for w in warnings)
 
     def test_with_slash_notation(self):
         """Grades like '15/20' should still be detected as numeric."""
         df = pd.DataFrame({"ID": ["1", "2"], "Résultat": ["15/20", "12,5/20"]})
-        col, _warnings = detect_grade_column(df, {"ID"})
+        col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
         # Should match by name first
         assert col == "Résultat"
 
     def test_prefix_match_note_slash_20(self):
         """'Note /20' should be detected via prefix matching."""
         df = pd.DataFrame({"ID": ["1", "2"], "Note /20": ["15", "16"]})
-        col, warnings = detect_grade_column(df, {"ID"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"ID"})
         assert col == "Note /20"
         assert any("prefix" in w.lower() for w in warnings)
 
     def test_prefix_match_note_slash_23(self):
         """'Note /23' should also work."""
         df = pd.DataFrame({"ID": ["1"], "Note /23": ["18"]})
-        col, _warnings = detect_grade_column(df, {"ID"})
+        col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
         assert col == "Note /23"
 
     def test_total_column_with_subscores(self):
@@ -292,7 +293,7 @@ class TestDetectGradeColumn:
                 "Total": ["6", "3"],
             }
         )
-        col, warnings = detect_grade_column(df, {"Numéro étudiant"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
         assert col == "Total"
         # Total is an exact alias match, so no warnings expected
         assert len(warnings) == 0
@@ -308,24 +309,24 @@ class TestDetectGradeColumn:
                 "Somme": ["6", "3"],
             }
         )
-        col, warnings = detect_grade_column(df, {"Numéro étudiant"})
+        col, warnings, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
         assert col == "Somme"
         assert any("summary" in w.lower() for w in warnings)
 
     def test_total_exact_name_match(self):
         """'Total' as exact alias match (no sub-score columns needed)."""
         df = pd.DataFrame({"ID": ["1"], "Total": ["15"]})
-        col, _warnings = detect_grade_column(df, {"ID"})
+        col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
         assert col == "Total"
 
     def test_ambiguous_prefix_matches(self):
         """Multiple prefix matches should be flagged as ambiguous."""
         df = pd.DataFrame({"ID": ["1"], "Note /20": ["15"], "Note finale /20": ["15"]})
-        _col, _warnings = detect_grade_column(df, {"ID"})
+        _col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
         # note finale is an exact alias, so it matches by name first
         # Let's test with two true prefix-only columns instead
         df2 = pd.DataFrame({"ID": ["1"], "Score /20": ["15"], "Score max": ["20"]})
-        col2, warnings2 = detect_grade_column(df2, {"ID"})
+        col2, warnings2, _ambiguous2 = detect_grade_column(df2, {"ID"})
         assert col2 is None
         assert any("AMBIGUOUS" in w for w in warnings2)
 
@@ -475,7 +476,7 @@ class TestReadFileHeaderDetection:
             "2,Marie,Curie,12346,15\n",
             encoding="utf-8",
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert not report.skipped
         assert report.grades_assigned == 2
         assert master.by_id["12345"].grade == 18.0
@@ -501,7 +502,7 @@ class TestReadFileHeaderDetection:
                 ["Marie", "Curie", "12346", "1", "2", "0.5", "3.5"],
             ],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert not report.skipped
         assert report.grades_assigned == 2
         assert master.by_id["12345"].grade == 6.0
@@ -711,7 +712,7 @@ class TestProcessTaFile:
             ["Numéro étudiant", "Note"],
             [["12345", "15"], ["12346", "14,5"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert not report.skipped
         assert report.grades_assigned == 2
         assert master.by_id["12345"].grade == 15.0
@@ -725,7 +726,7 @@ class TestProcessTaFile:
             ["Prénom", "Nom", "Note"],
             [["Jean", "Dupont", "16"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 16.0
 
@@ -738,7 +739,7 @@ class TestProcessTaFile:
             ["Prénom", "Nom", "Note"],
             [["Eloise", "Le Boeuf Andre", "17"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         # This should NOT match because œ ≠ oe in our normalization
         # (we only strip combining chars, not expand ligatures).
         # The user asked: "normalize for caps, accents, hyphens.
@@ -758,7 +759,7 @@ class TestProcessTaFile:
             ["Prénom", "Nom", "Note"],
             [["Éloïse", "Le Bœuf André", "18"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
 
     def test_ambiguous_name_skipped(self, tmp_path):
@@ -772,7 +773,7 @@ class TestProcessTaFile:
         master, _ = build_master_index(df)
         p = tmp_path / "ta.csv"
         _write_csv(p, ["Prénom", "Nom", "Note"], [["Jean", "Dupont", "14"]])
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 0
         assert any("matches 2 students" in w for w in report.warnings)
 
@@ -784,7 +785,7 @@ class TestProcessTaFile:
             ["Numéro étudiant", "Note"],
             [["99999", "15"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 0
         assert any("not found" in w.lower() for w in report.warnings)
 
@@ -797,7 +798,7 @@ class TestProcessTaFile:
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
             [["12345", "Pierre", "Martin", "15"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
         assert any("please verify" in w.lower() for w in report.warnings)
@@ -808,12 +809,12 @@ class TestProcessTaFile:
         # First file
         p1 = tmp_path / "ta1.csv"
         _write_csv(p1, ["Numéro étudiant", "Note"], [["12345", "15"]])
-        process_ta_file(p1, master)
+        process_ta_file(p1, master, interactive=False)
 
         # Second file
         p2 = tmp_path / "ta2.csv"
         _write_csv(p2, ["Numéro étudiant", "Note"], [["12345", "18"]])
-        report = process_ta_file(p2, master)
+        report = process_ta_file(p2, master, interactive=False)
         assert master.by_id["12345"].grade == 15.0  # first grade kept
         assert any("already has a grade" in w.lower() for w in report.warnings)
 
@@ -825,7 +826,7 @@ class TestProcessTaFile:
             ["Numéro étudiant", "Note"],
             [["12345", "ABS"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.students_absent == 1
         assert master.by_id["12345"].is_absent
         assert master.by_id["12345"].grade is None
@@ -839,7 +840,7 @@ class TestProcessTaFile:
             ["Numéro étudiant", "Note"],
             [["12345", "???"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 0
         assert master.by_id["12345"].grade is None
         assert any("could not parse" in w.lower() for w in report.warnings)
@@ -848,7 +849,7 @@ class TestProcessTaFile:
         master = self._setup_master()
         p = tmp_path / "ta.csv"
         p.write_text("Numéro étudiant,Note\n")
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.skipped
 
     def test_no_usable_columns_skipped(self, tmp_path):
@@ -860,7 +861,7 @@ class TestProcessTaFile:
             ["Foo", "Note"],
             [["bar", "15"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.skipped
         assert any("neither" in w.lower() for w in report.warnings)
 
@@ -871,7 +872,7 @@ class TestProcessTaFile:
         pd.DataFrame({"Numéro étudiant": ["12345"], "Note": ["15"]}).to_excel(
             p, index=False, engine="openpyxl"
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
 
     def test_ods_file(self, tmp_path):
@@ -881,7 +882,7 @@ class TestProcessTaFile:
         pd.DataFrame({"Numéro étudiant": ["12345"], "Note": ["15"]}).to_excel(
             p, index=False, engine="odf"
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
 
     def test_id_not_in_master_with_name_fallback(self, tmp_path):
@@ -893,7 +894,7 @@ class TestProcessTaFile:
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
             [["99999", "Jean", "Dupont", "13"]],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 13.0
         assert any("not found in master" in w.lower() for w in report.warnings)
@@ -908,7 +909,7 @@ class TestProcessTaFile:
             [["12345", "14,5"]],
             sep=";",
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 14.5
 
@@ -1166,7 +1167,7 @@ class TestIntegration:
             )
         )
 
-        master, reports = consolidate(cfg_path)
+        master, reports = consolidate(cfg_path, interactive=False)
 
         # Verify
         assert all(not r.skipped for r in reports)
@@ -1208,7 +1209,7 @@ class TestIntegration:
             )
         )
 
-        master, _reports = consolidate(cfg_path)
+        master, _reports = consolidate(cfg_path, interactive=False)
         assert master.by_id["S001"].grade == 17.0
 
     def test_grade_dir_integration(self, tmp_path):
@@ -1248,7 +1249,7 @@ class TestIntegration:
             )
         )
 
-        master, reports = consolidate(cfg_path)
+        master, reports = consolidate(cfg_path, interactive=False)
         assert len(reports) == 2
         assert all(not r.skipped for r in reports)
         assert master.by_id["S001"].grade == 16.0
@@ -1293,7 +1294,7 @@ class TestIntegration:
             )
         )
 
-        master, reports = consolidate(cfg_path)
+        master, reports = consolidate(cfg_path, interactive=False)
         assert len(reports) == 2
         assert master.by_id["S001"].grade == 15.0
         assert master.by_id["S002"].grade == 17.0
@@ -1317,7 +1318,7 @@ class TestEdgeCases:
         """
         df = pd.DataFrame({"Numéro étudiant": ["12345", "12346"], "Note": ["15", "16"]})
         # "Numéro étudiant" is already identified as ID
-        col, _ = detect_grade_column(df, {"Numéro étudiant"})
+        col, _, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
         assert col == "Note"
 
     def test_parse_grade_fraction_various(self):
@@ -1342,7 +1343,7 @@ class TestEdgeCases:
                 ["12348", "oops"],
             ],
         )
-        report = process_ta_file(p, master)
+        report = process_ta_file(p, master, interactive=False)
         # Should detect Mystery as grade column
         assert report.grades_assigned == 2  # 15 and 12.5
         assert report.students_absent == 1  # ABS
@@ -1394,6 +1395,81 @@ class TestEdgeCases:
             )
         )
 
-        master, _reports = consolidate(cfg_path)
+        master, _reports = consolidate(cfg_path, interactive=False)
         assert master.by_id["S001"].grade == 16.0
         assert master.by_id["S002"].grade == 14.0
+
+
+# ============================================================================
+# 14. Interactive column selection prompt
+# ============================================================================
+
+
+class TestPromptColumnChoice:
+    def test_select_first_option(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "1")
+        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
+        assert result == "Note /23"
+
+    def test_select_second_option(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "2")
+        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
+        assert result == "Note /20"
+
+    def test_select_skip(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "3")
+        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
+        assert result is None
+
+    def test_invalid_then_valid_input(self, monkeypatch):
+        inputs = iter(["abc", "0", "5", "1"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
+        assert result == "Note /23"
+
+    def test_eof_then_valid(self, monkeypatch):
+        """EOFError (e.g. piped input runs out) should retry."""
+        call_count = 0
+
+        def mock_input(_):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise EOFError
+            return "2"
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
+        assert result == "Note /20"
+
+    def test_interactive_process_ta_file(self, tmp_path, monkeypatch):
+        """End-to-end: ambiguous file + interactive selection = grade assigned."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Note /23", "Note /20"],
+            [["12345", "18", "15"]],
+        )
+        # User selects "Note /20" (option 2)
+        monkeypatch.setattr("builtins.input", lambda _: "2")
+        report = process_ta_file(p, master, interactive=True)
+        assert not report.skipped
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert any("manually selected" in w.lower() for w in report.warnings)
+
+    def test_interactive_skip_file(self, tmp_path, monkeypatch):
+        """User chooses to skip the file in the interactive prompt."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Note /23", "Note /20"],
+            [["12345", "18", "15"]],
+        )
+        # User selects skip (option 3)
+        monkeypatch.setattr("builtins.input", lambda _: "3")
+        report = process_ta_file(p, master, interactive=True)
+        assert report.skipped
+        assert master.by_id["12345"].grade is None

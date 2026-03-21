@@ -203,7 +203,7 @@ def detect_column(columns: list[str], role: str) -> str | None:
 
 def detect_grade_column(
     df: pd.DataFrame, known_columns: set[str]
-) -> tuple[str | None, list[str]]:
+) -> tuple[str | None, list[str], list[str]]:
     """
     Detect the grade column in *df*.
 
@@ -216,7 +216,8 @@ def detect_grade_column(
          If multiple candidates, prefer one named "Total" (or similar)
          when sub-score columns (Q1, Q2, ...) are present.
 
-    Returns (column_name_or_None, list_of_warnings).
+    Returns (column_name_or_None, list_of_warnings, ambiguous_candidates).
+    The third element is non-empty only when detection was ambiguous.
     """
     warnings: list[str] = []
     grade_aliases = {normalize_text(a) for a in COLUMN_ALIASES["grade"]}
@@ -224,7 +225,7 @@ def detect_grade_column(
     # 1. Exact name match
     by_name = detect_column(list(df.columns), "grade")
     if by_name is not None:
-        return by_name, warnings
+        return by_name, warnings, []
 
     # 2. Prefix match: column starts with a grade alias + separator
     prefix_matches: list[str] = []
@@ -242,13 +243,12 @@ def detect_grade_column(
         warnings.append(
             f"  Grade column detected by prefix match: '{prefix_matches[0]}'."
         )
-        return prefix_matches[0], warnings
+        return prefix_matches[0], warnings, []
     elif len(prefix_matches) > 1:
         warnings.append(
-            f"  AMBIGUOUS: multiple grade-like columns by prefix: {prefix_matches}. "
-            "Skipping this file - please specify manually."
+            f"  AMBIGUOUS: multiple grade-like columns by prefix: {prefix_matches}."
         )
-        return None, warnings
+        return None, warnings, prefix_matches
 
     # 3. Content-based
     grade_tokens = {"ABS", "DEF", "ABJ", "ABI", ""}
@@ -281,7 +281,7 @@ def detect_grade_column(
             f"  Grade column auto-detected by content: '{candidates[0]}' "
             "(no column name match)."
         )
-        return candidates[0], warnings
+        return candidates[0], warnings, []
     elif len(candidates) > 1:
         # Heuristic: if there are sub-score columns (Q1, Q2, ...) and one
         # candidate looks like a summary column, prefer it.
@@ -294,16 +294,13 @@ def detect_grade_column(
                 f"  Grade column auto-detected as summary column: "
                 f"'{summary_cols[0]}' (sub-score columns present)."
             )
-            return summary_cols[0], warnings
+            return summary_cols[0], warnings, []
 
-        warnings.append(
-            f"  AMBIGUOUS: multiple possible grade columns: {candidates}. "
-            "Skipping this file - please specify manually."
-        )
-        return None, warnings
+        warnings.append(f"  AMBIGUOUS: multiple possible grade columns: {candidates}.")
+        return None, warnings, candidates
     else:
         warnings.append("  No grade column detected. Skipping this file.")
-        return None, warnings
+        return None, warnings, []
 
 
 # ============================================================================
@@ -522,7 +519,38 @@ class FileReport:
     skipped: bool = False
 
 
-def process_ta_file(path: str | Path, master: MasterIndex) -> FileReport:
+def prompt_column_choice(candidates: list[str], filename: str) -> str | None:
+    """
+    Interactively ask the user to choose among ambiguous grade column candidates.
+
+    Returns the chosen column name, or None if the user chooses to skip.
+    """
+    print(f"\n  Multiple grade columns detected in '{filename}':")
+    for i, col in enumerate(candidates, 1):
+        print(f"    {i}. {col}")
+    print(f"    {len(candidates) + 1}. Skip this file")
+
+    while True:
+        try:
+            raw = input(f"  Choose column [1-{len(candidates) + 1}]: ").strip()
+            choice = int(raw)
+        except (ValueError, EOFError):
+            print("  Please enter a valid number.")
+            continue
+        if 1 <= choice <= len(candidates):
+            chosen = candidates[choice - 1]
+            print(f"  -> Using '{chosen}'")
+            return chosen
+        elif choice == len(candidates) + 1:
+            print("  -> Skipping file.")
+            return None
+        else:
+            print(f"  Please enter a number between 1 and {len(candidates) + 1}.")
+
+
+def process_ta_file(
+    path: str | Path, master: MasterIndex, *, interactive: bool = True
+) -> FileReport:
     """Process one TA grade file and update the master index in place."""
     path = Path(path)
     report = FileReport(filename=str(path))
@@ -549,8 +577,14 @@ def process_ta_file(path: str | Path, master: MasterIndex) -> FileReport:
 
     known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
 
-    grade_col, gw = detect_grade_column(df, known_cols)
+    grade_col, gw, ambiguous = detect_grade_column(df, known_cols)
     report.warnings.extend(gw)
+
+    if grade_col is None and ambiguous and interactive:
+        grade_col = prompt_column_choice(ambiguous, path.name)
+        if grade_col is not None:
+            report.warnings.append(f"  Grade column manually selected: '{grade_col}'.")
+
     if grade_col is None:
         report.skipped = True
         return report
@@ -838,7 +872,9 @@ def load_config(config_path: str | Path) -> dict:
     return cfg
 
 
-def consolidate(config_path: str | Path) -> tuple[MasterIndex, list[FileReport]]:
+def consolidate(
+    config_path: str | Path, *, interactive: bool = True
+) -> tuple[MasterIndex, list[FileReport]]:
     """
     Run the full consolidation pipeline.
     Returns (master_index, list_of_file_reports) for programmatic use.
@@ -879,7 +915,7 @@ def consolidate(config_path: str | Path) -> tuple[MasterIndex, list[FileReport]]
     reports: list[FileReport] = []
     for gf_path in grade_file_paths:
         print(f"Processing: {gf_path}")
-        report = process_ta_file(gf_path, master)
+        report = process_ta_file(gf_path, master, interactive=interactive)
         reports.append(report)
 
     # Write output
