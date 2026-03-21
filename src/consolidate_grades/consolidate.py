@@ -43,6 +43,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "code_etudiant",
         "numero",
         "numero d identification",
+        "no d identification",
     ],
     "first_name": [
         "prenom",
@@ -88,6 +89,9 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "note_finale",
         "final grade",
         "final_grade",
+        "total",
+        "total general",
+        "note totale",
     ],
 }
 
@@ -96,11 +100,13 @@ def normalize_text(text: str) -> str:
     """
     Normalise a string for matching purposes:
     - strip & lowercase
+    - replace ° and º with 'o' (French N° = Numéro convention)
     - decompose unicode and drop combining characters (accents)
     - replace hyphens, underscores, and apostrophes with spaces
     - collapse whitespace
     """
     text = text.strip().lower()
+    text = re.sub(r"[°º]", "o", text)
     nfkd = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in nfkd if not unicodedata.combining(c))
     text = re.sub(r"[-_'\u2018\u2019\u0027\u02BC]", " ", text)
@@ -118,6 +124,63 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     from all column names.  Returns the DataFrame (modified in place).
     """
     df.columns = [col.strip(_COLUMN_GARBAGE).strip() for col in df.columns]
+    return df
+
+
+def _count_alias_matches(values: list[str]) -> int:
+    """Count how many values in the list match any known column alias."""
+    all_aliases: set[str] = set()
+    for aliases in COLUMN_ALIASES.values():
+        for a in aliases:
+            all_aliases.add(normalize_text(a))
+    count = 0
+    for v in values:
+        if normalize_text(str(v)) in all_aliases:
+            count += 1
+    return count
+
+
+def find_header_row(df: pd.DataFrame) -> int | None:
+    """
+    Check whether the current DataFrame column headers look like real headers.
+    If not, scan the first 10 data rows for a row with more alias matches.
+
+    Returns the 0-based *data row index* to promote to header, or None if the
+    current headers are already the best candidate.
+
+    This handles files where TAs have put a title, corrector info, or other
+    metadata in the rows above the actual column headers.
+    """
+    current_matches = _count_alias_matches(
+        [str(c) for c in df.columns if str(c).strip() and str(c).lower() != "nan"]
+    )
+    if current_matches >= 2:
+        return None  # Current headers look fine
+
+    best_row: int | None = None
+    best_count = current_matches
+
+    for i in range(min(10, len(df))):
+        row_values = [
+            str(v).strip()
+            for v in df.iloc[i]
+            if pd.notna(v) and str(v).strip() and str(v).lower() != "nan"
+        ]
+        count = _count_alias_matches(row_values)
+        if count > best_count:
+            best_count = count
+            best_row = i
+
+    return best_row
+
+
+def promote_header_row(df: pd.DataFrame, row_idx: int) -> pd.DataFrame:
+    """
+    Promote a data row to column headers and drop all rows above it.
+    """
+    new_headers = [str(v).strip() if pd.notna(v) else "" for v in df.iloc[row_idx]]
+    df = df.iloc[row_idx + 1 :].reset_index(drop=True)
+    df.columns = new_headers
     return df
 
 
@@ -145,20 +208,49 @@ def detect_grade_column(
     Detect the grade column in *df*.
 
     Strategy:
-      1. Name-based matching using COLUMN_ALIASES["grade"].
-      2. Content-based: find columns that are ≥ 50 % numeric-like (including
+      1. Exact name-based matching using COLUMN_ALIASES["grade"].
+      2. Prefix matching: column name starts with a grade alias followed by
+         a separator (e.g. "Note /20", "Score final").
+      3. Content-based: find columns that are >= 50 % numeric-like (including
          ABS / DEF / ABJ tokens), excluding columns already assigned a role.
+         If multiple candidates, prefer one named "Total" (or similar)
+         when sub-score columns (Q1, Q2, ...) are present.
 
     Returns (column_name_or_None, list_of_warnings).
     """
     warnings: list[str] = []
+    grade_aliases = {normalize_text(a) for a in COLUMN_ALIASES["grade"]}
 
-    # 1. By name
+    # 1. Exact name match
     by_name = detect_column(list(df.columns), "grade")
     if by_name is not None:
         return by_name, warnings
 
-    # 2. By content
+    # 2. Prefix match: column starts with a grade alias + separator
+    prefix_matches: list[str] = []
+    for col in df.columns:
+        norm = normalize_text(col)
+        for alias in grade_aliases:
+            if norm.startswith(alias) and len(norm) > len(alias):
+                # Must be followed by a separator-like char (space, /)
+                rest = norm[len(alias) :]
+                if rest[0] in (" ", "/"):
+                    prefix_matches.append(col)
+                    break
+
+    if len(prefix_matches) == 1:
+        warnings.append(
+            f"  Grade column detected by prefix match: '{prefix_matches[0]}'."
+        )
+        return prefix_matches[0], warnings
+    elif len(prefix_matches) > 1:
+        warnings.append(
+            f"  AMBIGUOUS: multiple grade-like columns by prefix: {prefix_matches}. "
+            "Skipping this file - please specify manually."
+        )
+        return None, warnings
+
+    # 3. Content-based
     grade_tokens = {"ABS", "DEF", "ABJ", "ABI", ""}
     candidates: list[str] = []
 
@@ -191,9 +283,22 @@ def detect_grade_column(
         )
         return candidates[0], warnings
     elif len(candidates) > 1:
+        # Heuristic: if there are sub-score columns (Q1, Q2, ...) and one
+        # candidate looks like a summary column, prefer it.
+        summary_aliases = {"total", "total general", "note totale", "somme", "sum"}
+        summary_cols = [c for c in candidates if normalize_text(c) in summary_aliases]
+        has_subscores = any(re.match(r"^[Qq]\d+$", c.strip()) for c in df.columns)
+
+        if len(summary_cols) == 1 and has_subscores:
+            warnings.append(
+                f"  Grade column auto-detected as summary column: "
+                f"'{summary_cols[0]}' (sub-score columns present)."
+            )
+            return summary_cols[0], warnings
+
         warnings.append(
             f"  AMBIGUOUS: multiple possible grade columns: {candidates}. "
-            "Skipping this file — please specify manually."
+            "Skipping this file - please specify manually."
         )
         return None, warnings
     else:
@@ -216,29 +321,42 @@ def read_file(path: str | Path) -> pd.DataFrame:
     Python csv sniffer (``sep=None, engine='python'``).
 
     All formats: column names are cleaned of BOM markers and zero-width
-    characters after reading.
+    characters after reading.  If the first row doesn't look like headers
+    (e.g. a TA put a title row), scans the first 10 rows for the real
+    header row and promotes it.
     """
     path = Path(path)
     suffix = path.suffix.lower()
 
     if suffix == ".xlsx":
-        return clean_column_names(pd.read_excel(path, engine="openpyxl", dtype=str))
+        df = clean_column_names(pd.read_excel(path, engine="openpyxl", dtype=str))
     elif suffix == ".ods":
-        return clean_column_names(pd.read_excel(path, engine="odf", dtype=str))
+        df = clean_column_names(pd.read_excel(path, engine="odf", dtype=str))
     elif suffix in (".csv", ".tsv", ".txt"):
+        df = None
         for enc in _CSV_ENCODINGS:
             try:
-                df = pd.read_csv(
-                    path, sep=None, engine="python", encoding=enc, dtype=str
+                df = clean_column_names(
+                    pd.read_csv(
+                        path, sep=None, engine="python", encoding=enc, dtype=str
+                    )
                 )
-                return clean_column_names(df)
+                break
             except (UnicodeDecodeError, pd.errors.ParserError):
                 continue
-        raise ValueError(
-            f"Could not read '{path}' with any of the attempted encodings."
-        )
+        if df is None:
+            raise ValueError(
+                f"Could not read '{path}' with any of the attempted encodings."
+            )
     else:
         raise ValueError(f"Unsupported file extension: '{suffix}' for file '{path}'.")
+
+    # Check if headers are in a later row (TA added title/metadata above)
+    header_row = find_header_row(df)
+    if header_row is not None:
+        df = clean_column_names(promote_header_row(df, header_row))
+
+    return df
 
 
 # ============================================================================

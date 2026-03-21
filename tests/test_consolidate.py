@@ -20,12 +20,14 @@ from consolidate_grades.consolidate import (
     consolidate,
     detect_column,
     detect_grade_column,
+    find_header_row,
     load_config,
     make_name_key,
     normalize_name,
     normalize_text,
     parse_grade,
     process_ta_file,
+    promote_header_row,
     read_file,
     resolve_grade_files,
     write_moodle_csv,
@@ -105,6 +107,13 @@ class TestNormalizeText:
     def test_left_curly_apostrophe(self):
         assert normalize_text("l\u2018exemple") == "l exemple"
 
+    def test_degree_sign_becomes_o(self):
+        assert normalize_text("N°") == "no"
+        assert normalize_text("N° d'identification") == "no d identification"
+
+    def test_ordinal_indicator_becomes_o(self):
+        assert normalize_text("Nº etudiant") == "no etudiant"
+
 
 # ============================================================================
 # 1b. clean_column_names
@@ -150,6 +159,7 @@ class TestDetectColumn:
             "No étudiant",
             "Numéro d\u2019identification",
             "Numéro d'identification",
+            "N° d'identification",
         ],
     )
     def test_id_variants(self, col_name):
@@ -190,7 +200,17 @@ class TestDetectColumn:
     # --- Grade ---
     @pytest.mark.parametrize(
         "col_name",
-        ["Note", "Grade", "Score", "Résultat", "Mark", "Points", "Note finale"],
+        [
+            "Note",
+            "Grade",
+            "Score",
+            "Résultat",
+            "Mark",
+            "Points",
+            "Note finale",
+            "Total",
+            "Total général",
+        ],
     )
     def test_grade_variants(self, col_name):
         assert detect_column([col_name, "Other"], "grade") == col_name
@@ -248,10 +268,244 @@ class TestDetectGradeColumn:
         # Should match by name first
         assert col == "Résultat"
 
+    def test_prefix_match_note_slash_20(self):
+        """'Note /20' should be detected via prefix matching."""
+        df = pd.DataFrame({"ID": ["1", "2"], "Note /20": ["15", "16"]})
+        col, warnings = detect_grade_column(df, {"ID"})
+        assert col == "Note /20"
+        assert any("prefix" in w.lower() for w in warnings)
+
+    def test_prefix_match_note_slash_23(self):
+        """'Note /23' should also work."""
+        df = pd.DataFrame({"ID": ["1"], "Note /23": ["18"]})
+        col, _warnings = detect_grade_column(df, {"ID"})
+        assert col == "Note /23"
+
+    def test_total_column_with_subscores(self):
+        """'Total' preferred over Q1-Q14 sub-score columns via exact alias."""
+        df = pd.DataFrame(
+            {
+                "Numéro étudiant": ["1", "2"],
+                "Q1": ["2", "1"],
+                "Q2": ["3", "2"],
+                "Q3": ["1", "0"],
+                "Total": ["6", "3"],
+            }
+        )
+        col, warnings = detect_grade_column(df, {"Numéro étudiant"})
+        assert col == "Total"
+        # Total is an exact alias match, so no warnings expected
+        assert len(warnings) == 0
+
+    def test_summary_column_preferred_over_subscores(self):
+        """When summary column is not an alias, prefer it via content heuristic."""
+        df = pd.DataFrame(
+            {
+                "Numéro étudiant": ["1", "2"],
+                "Q1": ["2", "1"],
+                "Q2": ["3", "2"],
+                "Q3": ["1", "0"],
+                "Somme": ["6", "3"],
+            }
+        )
+        col, warnings = detect_grade_column(df, {"Numéro étudiant"})
+        assert col == "Somme"
+        assert any("summary" in w.lower() for w in warnings)
+
+    def test_total_exact_name_match(self):
+        """'Total' as exact alias match (no sub-score columns needed)."""
+        df = pd.DataFrame({"ID": ["1"], "Total": ["15"]})
+        col, _warnings = detect_grade_column(df, {"ID"})
+        assert col == "Total"
+
+    def test_ambiguous_prefix_matches(self):
+        """Multiple prefix matches should be flagged as ambiguous."""
+        df = pd.DataFrame({"ID": ["1"], "Note /20": ["15"], "Note finale /20": ["15"]})
+        _col, _warnings = detect_grade_column(df, {"ID"})
+        # note finale is an exact alias, so it matches by name first
+        # Let's test with two true prefix-only columns instead
+        df2 = pd.DataFrame({"ID": ["1"], "Score /20": ["15"], "Score max": ["20"]})
+        col2, warnings2 = detect_grade_column(df2, {"ID"})
+        assert col2 is None
+        assert any("AMBIGUOUS" in w for w in warnings2)
+
 
 # ============================================================================
-# 4. read_file - CSV / XLSX / ODS
+# 3b. Header row detection
 # ============================================================================
+
+
+class TestFindHeaderRow:
+    def test_good_headers_returns_none(self):
+        """When headers are already correct, return None."""
+        df = pd.DataFrame({"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]})
+        assert find_header_row(df) is None
+
+    def test_title_in_row_0(self):
+        """Title in row 0, real headers in data row 0 (original row 1)."""
+        df = pd.DataFrame(
+            {
+                "Notes QCM CC 9 mars 2026 EI-3": [
+                    "Numero",
+                    "12345",
+                ],
+                "Unnamed: 1": ["Prenom", "Alice"],
+                "Unnamed: 2": ["Nom", "Martin"],
+                "Unnamed: 3": ["Numero etudiant", "12345"],
+                "Unnamed: 4": ["Note /23", "18"],
+            }
+        )
+        row = find_header_row(df)
+        assert row == 0
+
+    def test_multiple_metadata_rows(self):
+        """Multiple metadata rows before real headers."""
+        df = pd.DataFrame(
+            {
+                "Notes - UL1IN002": [
+                    "Correcteur : Bilal",
+                    "",
+                    "Numero d'etudiant",
+                    "12345",
+                ],
+                "Unnamed: 1": [
+                    "Groupes : DC-1",
+                    "",
+                    "Nom",
+                    "Martin",
+                ],
+                "Unnamed: 2": ["", "", "Prenom", "Alice"],
+                "Unnamed: 3": ["", "", "Note", "15"],
+            }
+        )
+        row = find_header_row(df)
+        assert row == 2
+
+    def test_no_alias_matches_anywhere(self):
+        """When no row has alias matches, return None (stay with current)."""
+        df = pd.DataFrame(
+            {
+                "Foo": ["bar", "baz"],
+                "Qux": ["quux", "corge"],
+            }
+        )
+        assert find_header_row(df) is None
+
+    def test_promote_header_row(self):
+        """promote_header_row drops preamble and sets new headers."""
+        df = pd.DataFrame(
+            {
+                "Title": ["Metadata", "Nom", "Martin"],
+                "Col2": ["Info", "Prenom", "Alice"],
+                "Col3": ["", "Note", "15"],
+            }
+        )
+        new_df = promote_header_row(df, 1)
+        assert list(new_df.columns) == ["Nom", "Prenom", "Note"]
+        assert len(new_df) == 1
+        assert new_df.iloc[0]["Nom"] == "Martin"
+
+
+class TestReadFileHeaderDetection:
+    def test_csv_with_title_row(self, tmp_path):
+        """CSV where row 1 has a title, row 2 has real headers."""
+        p = tmp_path / "ta.csv"
+        p.write_text(
+            "Notes QCM CC 9 mars 2026 EI-3,,,,\n"
+            "Numero,Prenom,Nom,Numero etudiant,Note /23\n"
+            "1,Alice,Martin,12345,18\n",
+            encoding="utf-8",
+        )
+        df = read_file(p)
+        assert "Numero etudiant" in df.columns or "Numero" in df.columns
+        assert len(df) == 1
+
+    def test_csv_with_multiple_metadata_rows(self, tmp_path):
+        """CSV with 3 rows of metadata before the real headers."""
+        p = tmp_path / "ta.csv"
+        p.write_text(
+            "Notes Elements de programmation 2,,,\n"
+            "Correcteur : Bilal,Groupes : DC-1,,\n"
+            ",,,\n"
+            "Numero d'etudiant,Nom,Prenom,Note\n"
+            "12345,Martin,Alice,15\n",
+            encoding="utf-8",
+        )
+        df = read_file(p)
+        # The header detection should have found the real header row
+        cols_norm = [c.lower() for c in df.columns]
+        assert any(c == "nom" for c in cols_norm)
+        assert len(df) == 1
+
+    def test_xlsx_with_title_row(self, tmp_path):
+        """XLSX where row 1 has a title, row 2 has real headers."""
+        p = tmp_path / "ta.xlsx"
+        raw = pd.DataFrame(
+            {
+                "Notes QCM": ["Numero etudiant", "12345"],
+                "Unnamed: 1": ["Nom", "Martin"],
+                "Unnamed: 2": ["Note", "15"],
+            }
+        )
+        raw.to_excel(p, index=False, engine="openpyxl")
+        df = read_file(p)
+        assert detect_column(list(df.columns), "id") is not None
+        assert len(df) == 1
+
+    def test_normal_csv_not_degraded(self, tmp_path):
+        """A normal CSV should NOT have its headers changed."""
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Alice", "Martin", "15"]],
+        )
+        df = read_file(p)
+        assert df.columns[0] == "Numéro étudiant"
+        assert len(df) == 1
+
+    def test_integration_ta_file_with_title_row(self, tmp_path):
+        """Full pipeline with a TA file that has a title row."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        p.write_text(
+            "Notes QCM CC 9 mars 2026,,,,\n"
+            "Numero,Prenom,Nom,Numero etudiant,Note /23\n"
+            "1,Jean,Dupont,12345,18\n"
+            "2,Marie,Curie,12346,15\n",
+            encoding="utf-8",
+        )
+        report = process_ta_file(p, master)
+        assert not report.skipped
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 18.0
+        assert master.by_id["12346"].grade == 15.0
+
+    def test_integration_ta_file_with_subscores_and_total(self, tmp_path):
+        """TA file with Q1-Q14 sub-scores and a Total column."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            [
+                "Prénom",
+                "Nom de famille",
+                "N° d'identification",
+                "Q1",
+                "Q2",
+                "Q3",
+                "Total",
+            ],
+            [
+                ["Jean", "Dupont", "12345", "2", "3", "1", "6"],
+                ["Marie", "Curie", "12346", "1", "2", "0.5", "3.5"],
+            ],
+        )
+        report = process_ta_file(p, master)
+        assert not report.skipped
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 6.0
+        assert master.by_id["12346"].grade == 3.5
 
 
 class TestReadFile:
