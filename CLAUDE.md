@@ -33,6 +33,11 @@ make format       # Run ruff format + ruff check --fix
 - **Name normalisation** strips accents and hyphens only. Ligatures (œ, æ) are deliberately preserved — this matches the user's specification.
 - **Grade parsing** is permissive: comma/dot decimals, `/20` suffixes, absent tokens (ABS/DEF/ABJ/ABI). No assumption about max grade.
 - **All warnings** go to the console summary, never silently swallowed.
+- **Grade file resolution** supports explicit `grade_files` list, a `grade_dir` directory scan, or both (deduplicated by resolved path). Directory scan picks up `.csv`, `.xlsx`, `.ods`, `.tsv`, `.txt` and sorts alphabetically for deterministic order.
+
+## CI
+
+GitHub Actions runs on push/PR to main. Matrix: Python 3.10–3.13. Steps: install, ruff check, ruff format --check, pytest. Workflow file: `.github/workflows/ci.yml`.
 
 ## Testing conventions
 

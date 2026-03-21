@@ -633,6 +633,49 @@ def print_summary(
 # ============================================================================
 
 
+SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".txt", ".xlsx", ".ods"}
+
+
+def resolve_grade_files(
+    config_dir: Path,
+    grade_files: list[str] | None = None,
+    grade_dir: str | None = None,
+) -> list[Path]:
+    """
+    Build the list of grade file paths from explicit file list, directory scan,
+    or both.  Deduplicates by resolved absolute path and sorts for determinism.
+    """
+    seen: set[Path] = set()
+    result: list[Path] = []
+
+    def _add(p: Path) -> None:
+        resolved = p.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(p)
+
+    # Explicit file list
+    if grade_files:
+        for gf in grade_files:
+            gf_path = Path(gf)
+            if not gf_path.is_absolute():
+                gf_path = config_dir / gf_path
+            _add(gf_path)
+
+    # Directory scan
+    if grade_dir:
+        dir_path = Path(grade_dir)
+        if not dir_path.is_absolute():
+            dir_path = config_dir / dir_path
+        if not dir_path.is_dir():
+            raise ValueError(f"grade_dir '{dir_path}' is not a directory.")
+        for child in sorted(dir_path.iterdir()):
+            if child.is_file() and child.suffix.lower() in SUPPORTED_EXTENSIONS:
+                _add(child)
+
+    return result
+
+
 def load_config(config_path: str | Path) -> dict:
     """Load and validate the YAML configuration file."""
     config_path = Path(config_path)
@@ -646,8 +689,15 @@ def load_config(config_path: str | Path) -> dict:
         raise ValueError("Config file must be a YAML mapping.")
     if "master_file" not in cfg:
         raise ValueError("Config must specify 'master_file'.")
-    if "grade_files" not in cfg or not isinstance(cfg["grade_files"], list):
-        raise ValueError("Config must specify 'grade_files' as a list.")
+
+    has_files = "grade_files" in cfg and isinstance(cfg.get("grade_files"), list)
+    has_dir = "grade_dir" in cfg and isinstance(cfg.get("grade_dir"), str)
+
+    if not has_files and not has_dir:
+        raise ValueError(
+            "Config must specify 'grade_files' (list) and/or 'grade_dir' (path)."
+        )
+
     cfg.setdefault("output_file", "grades_consolidated.csv")
     return cfg
 
@@ -679,12 +729,19 @@ def consolidate(config_path: str | Path) -> tuple[MasterIndex, list[FileReport]]
         for w in master_warnings:
             print(w)
 
+    # Resolve grade file list
+    grade_file_paths = resolve_grade_files(
+        config_dir,
+        grade_files=cfg.get("grade_files"),
+        grade_dir=cfg.get("grade_dir"),
+    )
+
+    if not grade_file_paths:
+        print("WARNING: No grade files found. Output will have no grades.")
+
     # Process TA files
     reports: list[FileReport] = []
-    for gf in cfg["grade_files"]:
-        gf_path = Path(gf)
-        if not gf_path.is_absolute():
-            gf_path = config_dir / gf_path
+    for gf_path in grade_file_paths:
         print(f"Processing: {gf_path}")
         report = process_ta_file(gf_path, master)
         reports.append(report)

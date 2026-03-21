@@ -26,6 +26,7 @@ from consolidate_grades.consolidate import (
     parse_grade,
     process_ta_file,
     read_file,
+    resolve_grade_files,
     write_moodle_csv,
 )
 
@@ -657,7 +658,7 @@ class TestWriteMoodleCsv:
 
 
 class TestLoadConfig:
-    def test_valid_config(self, tmp_path):
+    def test_valid_config_with_files(self, tmp_path):
         cfg_path = tmp_path / "config.yaml"
         cfg_path.write_text(
             yaml.dump(
@@ -671,16 +672,45 @@ class TestLoadConfig:
         cfg = load_config(cfg_path)
         assert cfg["master_file"] == "master.csv"
 
+    def test_valid_config_with_dir(self, tmp_path):
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_dir": "grades/",
+                    "output_file": "out.csv",
+                }
+            )
+        )
+        cfg = load_config(cfg_path)
+        assert cfg["grade_dir"] == "grades/"
+
+    def test_valid_config_with_both(self, tmp_path):
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["extra.csv"],
+                    "grade_dir": "grades/",
+                }
+            )
+        )
+        cfg = load_config(cfg_path)
+        assert "grade_files" in cfg
+        assert "grade_dir" in cfg
+
     def test_missing_master_raises(self, tmp_path):
         cfg_path = tmp_path / "config.yaml"
         cfg_path.write_text(yaml.dump({"grade_files": ["g1.csv"]}))
         with pytest.raises(ValueError, match="master_file"):
             load_config(cfg_path)
 
-    def test_missing_grade_files_raises(self, tmp_path):
+    def test_missing_both_grade_sources_raises(self, tmp_path):
         cfg_path = tmp_path / "config.yaml"
         cfg_path.write_text(yaml.dump({"master_file": "m.csv"}))
-        with pytest.raises(ValueError, match="grade_files"):
+        with pytest.raises(ValueError, match=r"grade_files.*grade_dir"):
             load_config(cfg_path)
 
     def test_default_output(self, tmp_path):
@@ -690,6 +720,93 @@ class TestLoadConfig:
         )
         cfg = load_config(cfg_path)
         assert cfg["output_file"] == "grades_consolidated.csv"
+
+
+# ============================================================================
+# 11. resolve_grade_files
+# ============================================================================
+
+
+class TestResolveGradeFiles:
+    def test_explicit_files_only(self, tmp_path):
+        (tmp_path / "a.csv").write_text("x")
+        (tmp_path / "b.xlsx").write_text("x")
+        result = resolve_grade_files(tmp_path, grade_files=["a.csv", "b.xlsx"])
+        assert len(result) == 2
+        assert result[0].name == "a.csv"
+        assert result[1].name == "b.xlsx"
+
+    def test_dir_only(self, tmp_path):
+        grade_dir = tmp_path / "grades"
+        grade_dir.mkdir()
+        (grade_dir / "g1.csv").write_text("x")
+        (grade_dir / "g2.xlsx").write_text("x")
+        (grade_dir / "g3.ods").write_text("x")
+        (grade_dir / "readme.txt").write_text("x")  # .txt is supported
+        (grade_dir / "notes.pdf").write_text("x")  # .pdf is NOT supported
+        result = resolve_grade_files(tmp_path, grade_dir="grades")
+        names = [p.name for p in result]
+        assert "g1.csv" in names
+        assert "g2.xlsx" in names
+        assert "g3.ods" in names
+        assert "readme.txt" in names
+        assert "notes.pdf" not in names
+
+    def test_dir_ignores_subdirectories(self, tmp_path):
+        grade_dir = tmp_path / "grades"
+        grade_dir.mkdir()
+        (grade_dir / "g1.csv").write_text("x")
+        sub = grade_dir / "subdir"
+        sub.mkdir()
+        (sub / "nested.csv").write_text("x")
+        result = resolve_grade_files(tmp_path, grade_dir="grades")
+        assert len(result) == 1
+        assert result[0].name == "g1.csv"
+
+    def test_both_files_and_dir(self, tmp_path):
+        grade_dir = tmp_path / "grades"
+        grade_dir.mkdir()
+        (grade_dir / "from_dir.csv").write_text("x")
+        (tmp_path / "extra.csv").write_text("x")
+        result = resolve_grade_files(
+            tmp_path, grade_files=["extra.csv"], grade_dir="grades"
+        )
+        names = [p.name for p in result]
+        assert "extra.csv" in names
+        assert "from_dir.csv" in names
+
+    def test_deduplication(self, tmp_path):
+        """Same file listed explicitly and found in directory."""
+        grade_dir = tmp_path / "grades"
+        grade_dir.mkdir()
+        (grade_dir / "g1.csv").write_text("x")
+        result = resolve_grade_files(
+            tmp_path, grade_files=["grades/g1.csv"], grade_dir="grades"
+        )
+        assert len(result) == 1
+
+    def test_dir_sorted_deterministic(self, tmp_path):
+        grade_dir = tmp_path / "grades"
+        grade_dir.mkdir()
+        for name in ["charlie.csv", "alpha.csv", "bravo.csv"]:
+            (grade_dir / name).write_text("x")
+        result = resolve_grade_files(tmp_path, grade_dir="grades")
+        names = [p.name for p in result]
+        assert names == ["alpha.csv", "bravo.csv", "charlie.csv"]
+
+    def test_invalid_dir_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="not a directory"):
+            resolve_grade_files(tmp_path, grade_dir="nonexistent")
+
+    def test_empty_dir_returns_empty(self, tmp_path):
+        grade_dir = tmp_path / "grades"
+        grade_dir.mkdir()
+        result = resolve_grade_files(tmp_path, grade_dir="grades")
+        assert result == []
+
+    def test_neither_files_nor_dir(self, tmp_path):
+        result = resolve_grade_files(tmp_path)
+        assert result == []
 
 
 # ============================================================================
@@ -794,6 +911,93 @@ class TestIntegration:
 
         master, _reports = consolidate(cfg_path)
         assert master.by_id["S001"].grade == 17.0
+
+    def test_grade_dir_integration(self, tmp_path):
+        """Full pipeline using grade_dir instead of grade_files."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [
+                ["S001", "Alice", "Martin", "alice@univ.fr"],
+                ["S002", "Bob", "Bernard", "bob@univ.fr"],
+            ],
+        )
+
+        grade_dir = tmp_path / "ta_grades"
+        grade_dir.mkdir()
+        _write_csv(
+            grade_dir / "group1.csv",
+            ["Student ID", "Grade"],
+            [["S001", "16"]],
+        )
+        pd.DataFrame({"Numéro étudiant": ["S002"], "Note": ["14,5"]}).to_excel(
+            grade_dir / "group2.xlsx", index=False, engine="openpyxl"
+        )
+
+        # Also put a non-grade file in the dir to make sure it's skipped
+        (grade_dir / "notes.pdf").write_text("not a spreadsheet")
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_dir": "ta_grades",
+                    "output_file": "results.csv",
+                }
+            )
+        )
+
+        master, reports = consolidate(cfg_path)
+        assert len(reports) == 2
+        assert all(not r.skipped for r in reports)
+        assert master.by_id["S001"].grade == 16.0
+        assert master.by_id["S002"].grade == 14.5
+
+    def test_grade_dir_and_files_combined(self, tmp_path):
+        """grade_files and grade_dir can be used together."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [
+                ["S001", "Alice", "Martin", "alice@univ.fr"],
+                ["S002", "Bob", "Bernard", "bob@univ.fr"],
+            ],
+        )
+
+        grade_dir = tmp_path / "ta_grades"
+        grade_dir.mkdir()
+        _write_csv(
+            grade_dir / "group1.csv",
+            ["Student ID", "Grade"],
+            [["S001", "15"]],
+        )
+
+        # An extra file outside the directory
+        _write_csv(
+            tmp_path / "extra_ta.csv",
+            ["Student ID", "Grade"],
+            [["S002", "17"]],
+        )
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["extra_ta.csv"],
+                    "grade_dir": "ta_grades",
+                    "output_file": "results.csv",
+                }
+            )
+        )
+
+        master, reports = consolidate(cfg_path)
+        assert len(reports) == 2
+        assert master.by_id["S001"].grade == 15.0
+        assert master.by_id["S002"].grade == 17.0
 
 
 # ============================================================================

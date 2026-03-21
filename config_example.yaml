@@ -4,9 +4,18 @@
 
 master_file: "master.csv"
 
-grade_files:
-  - "group1_grades.csv"
-  - "group2_grades.xlsx"
-  - "group3_grades.ods"
+# Option 1: List grade files explicitly
+# grade_files:
+#   - "group1_grades.csv"
+#   - "group2_grades.xlsx"
+#   - "group3_grades.ods"
+
+# Option 2: Point to a directory - all .csv, .xlsx, .ods, .tsv files are picked up
+grade_dir: "ta_grades/"
+
+# Option 3: Both - files from grade_files + everything in grade_dir (deduplicated)
+# grade_files:
+#   - "late_submission.csv"
+# grade_dir: "ta_grades/"
 
 output_file: "grades_consolidated.csv"

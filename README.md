@@ -30,7 +30,7 @@ decimals, `/20` suffixes, `ABS` markers…
 
 ```bash
 # Clone and install
-git clone https://github.com/<your-username>/grade-consolidator.git
+git clone https://github.com/fbouchet/grade-consolidator.git
 cd grade-consolidator
 
 # Create a virtual environment (recommended)
@@ -56,15 +56,22 @@ Requires Python 3.10+.
 # config.yaml
 master_file: "students_master.csv"
 
+# Option A: list files explicitly
 grade_files:
   - "group1_grades.csv"
   - "group2_grades.xlsx"
   - "group3_grades.ods"
 
+# Option B: point to a directory (all .csv/.xlsx/.ods/.tsv files are picked up)
+grade_dir: "ta_grades/"
+
+# Option C: both — files from grade_files + everything in grade_dir (deduplicated)
+
 output_file: "moodle_import.csv"
 ```
 
-Paths are resolved relative to the config file's directory.
+Paths are resolved relative to the config file's directory. You must specify at
+least one of `grade_files` or `grade_dir` (or both).
 
 ### 2. Run
 

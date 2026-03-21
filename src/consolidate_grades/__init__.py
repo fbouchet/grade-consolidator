@@ -8,6 +8,7 @@ into a single Moodle-compatible CSV.
 from consolidate_grades.consolidate import (
     ABSENT_TOKENS,
     COLUMN_ALIASES,
+    SUPPORTED_EXTENSIONS,
     FileReport,
     MasterIndex,
     ParsedGrade,
@@ -24,12 +25,14 @@ from consolidate_grades.consolidate import (
     parse_grade,
     process_ta_file,
     read_file,
+    resolve_grade_files,
     write_moodle_csv,
 )
 
 __all__ = [
     "ABSENT_TOKENS",
     "COLUMN_ALIASES",
+    "SUPPORTED_EXTENSIONS",
     "FileReport",
     "MasterIndex",
     "ParsedGrade",
@@ -46,5 +49,6 @@ __all__ = [
     "parse_grade",
     "process_ta_file",
     "read_file",
+    "resolve_grade_files",
     "write_moodle_csv",
 ]
