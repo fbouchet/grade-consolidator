@@ -16,6 +16,7 @@ import yaml
 
 from consolidate_grades.consolidate import (
     build_master_index,
+    clean_column_names,
     consolidate,
     detect_column,
     detect_grade_column,
@@ -92,10 +93,44 @@ class TestNormalizeText:
     def test_combined(self):
         assert normalize_text("  Numéro_Étudiant  ") == "numero etudiant"
 
+    def test_ascii_apostrophe_becomes_space(self):
+        assert normalize_text("Numéro d'identification") == "numero d identification"
+
+    def test_curly_apostrophe_becomes_space(self):
+        assert (
+            normalize_text("Num\u00e9ro d\u2019identification")
+            == "numero d identification"
+        )
+
+    def test_left_curly_apostrophe(self):
+        assert normalize_text("l\u2018exemple") == "l exemple"
+
 
 # ============================================================================
-# 2. detect_column - various alias forms
+# 1b. clean_column_names
 # ============================================================================
+
+
+class TestCleanColumnNames:
+    def test_bom_stripped(self):
+        df = pd.DataFrame({"\ufeffPrénom": ["Alice"], "Nom": ["Martin"]})
+        cleaned = clean_column_names(df)
+        assert list(cleaned.columns) == ["Prénom", "Nom"]
+
+    def test_zero_width_space_stripped(self):
+        df = pd.DataFrame({"\u200bID": ["1"], "Note\u200b": ["15"]})
+        cleaned = clean_column_names(df)
+        assert list(cleaned.columns) == ["ID", "Note"]
+
+    def test_surrounding_whitespace_stripped(self):
+        df = pd.DataFrame({"  Prénom  ": ["Alice"], " Nom ": ["Martin"]})
+        cleaned = clean_column_names(df)
+        assert list(cleaned.columns) == ["Prénom", "Nom"]
+
+    def test_clean_columns_already_clean(self):
+        df = pd.DataFrame({"Prénom": ["Alice"], "Nom": ["Martin"]})
+        cleaned = clean_column_names(df)
+        assert list(cleaned.columns) == ["Prénom", "Nom"]
 
 
 class TestDetectColumn:
@@ -113,6 +148,8 @@ class TestDetectColumn:
             "Identifiant",
             "Code étudiant",
             "No étudiant",
+            "Numéro d\u2019identification",
+            "Numéro d'identification",
         ],
     )
     def test_id_variants(self, col_name):
@@ -137,7 +174,15 @@ class TestDetectColumn:
     # --- Email ---
     @pytest.mark.parametrize(
         "col_name",
-        ["Email", "Mail", "Courriel", "Adresse email", "E-mail", "Email address"],
+        [
+            "Email",
+            "Mail",
+            "Courriel",
+            "Adresse email",
+            "E-mail",
+            "Email address",
+            "Adresse de courriel",
+        ],
     )
     def test_email_variants(self, col_name):
         assert detect_column([col_name, "Other"], "email") == col_name
@@ -1048,3 +1093,53 @@ class TestEdgeCases:
         assert report.grades_assigned == 2  # 15 and 12.5
         assert report.students_absent == 1  # ABS
         assert master.by_id["12345"].grade == 15.0
+
+    def test_bom_in_csv_column_names(self, tmp_path):
+        """BOM character in CSV should not break column detection."""
+        p = tmp_path / "master.csv"
+        # Write raw bytes with BOM prefix on first column
+        p.write_bytes(
+            "\ufeffPrénom,Nom de famille,Numéro d\u2019identification,"
+            "Adresse de courriel\n"
+            "Alice,Martin,S001,alice@univ.fr\n".encode()
+        )
+        df = read_file(p)
+        assert "Prénom" in df.columns  # BOM stripped
+        master, _warnings = build_master_index(df)
+        assert "S001" in master.by_id
+        assert master.by_id["S001"].first_name == "Alice"
+        assert master.by_id["S001"].email == "alice@univ.fr"
+
+    def test_moodle_export_format(self, tmp_path):
+        """End-to-end with a Moodle-style master export (BOM + curly quotes)."""
+        # Master: Moodle export format
+        master_path = tmp_path / "participants.csv"
+        master_path.write_bytes(
+            "\ufeffPrénom,Nom de famille,Numéro d\u2019identification,"
+            "Adresse de courriel,Groupes\n"
+            "Alice,Martin,S001,alice@univ.fr,Groupe 1\n"
+            "Bob,Bernard,S002,bob@univ.fr,Groupe 2\n".encode()
+        )
+
+        # TA file
+        ta_path = tmp_path / "grades.csv"
+        _write_csv(
+            ta_path,
+            ["Student ID", "Grade"],
+            [["S001", "16"], ["S002", "14"]],
+        )
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "participants.csv",
+                    "grade_files": ["grades.csv"],
+                    "output_file": "out.csv",
+                }
+            )
+        )
+
+        master, _reports = consolidate(cfg_path)
+        assert master.by_id["S001"].grade == 16.0
+        assert master.by_id["S002"].grade == 14.0

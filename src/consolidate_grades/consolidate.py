@@ -42,6 +42,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "code etudiant",
         "code_etudiant",
         "numero",
+        "numero d identification",
     ],
     "first_name": [
         "prenom",
@@ -70,6 +71,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "adresse email",
         "adresse mail",
         "adresse_email",
+        "adresse de courriel",
         "e-mail",
         "email address",
     ],
@@ -95,15 +97,28 @@ def normalize_text(text: str) -> str:
     Normalise a string for matching purposes:
     - strip & lowercase
     - decompose unicode and drop combining characters (accents)
-    - replace hyphens and underscores with spaces
+    - replace hyphens, underscores, and apostrophes with spaces
     - collapse whitespace
     """
     text = text.strip().lower()
     nfkd = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in nfkd if not unicodedata.combining(c))
-    text = re.sub(r"[-_]", " ", text)
+    text = re.sub(r"[-_'\u2018\u2019\u0027\u02BC]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+# Characters to strip from the start of column names (BOM, zero-width spaces, etc.)
+_COLUMN_GARBAGE = "\ufeff\u200b\u200c\u200d\ufffe"
+
+
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Strip BOM markers, zero-width characters, and surrounding whitespace
+    from all column names.  Returns the DataFrame (modified in place).
+    """
+    df.columns = [col.strip(_COLUMN_GARBAGE).strip() for col in df.columns]
+    return df
 
 
 def detect_column(columns: list[str], role: str) -> str | None:
@@ -199,21 +214,24 @@ def read_file(path: str | Path) -> pd.DataFrame:
 
     CSV: tries several encodings and auto-detects the delimiter via the
     Python csv sniffer (``sep=None, engine='python'``).
+
+    All formats: column names are cleaned of BOM markers and zero-width
+    characters after reading.
     """
     path = Path(path)
     suffix = path.suffix.lower()
 
     if suffix == ".xlsx":
-        return pd.read_excel(path, engine="openpyxl", dtype=str)
+        return clean_column_names(pd.read_excel(path, engine="openpyxl", dtype=str))
     elif suffix == ".ods":
-        return pd.read_excel(path, engine="odf", dtype=str)
+        return clean_column_names(pd.read_excel(path, engine="odf", dtype=str))
     elif suffix in (".csv", ".tsv", ".txt"):
         for enc in _CSV_ENCODINGS:
             try:
                 df = pd.read_csv(
                     path, sep=None, engine="python", encoding=enc, dtype=str
                 )
-                return df
+                return clean_column_names(df)
             except (UnicodeDecodeError, pd.errors.ParserError):
                 continue
         raise ValueError(

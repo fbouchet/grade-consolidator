@@ -1,0 +1,21 @@
+# consolidate_grades configuration
+# ---------------------------------
+# Paths are relative to this config file's directory.
+
+master_file: "/home/francois/Nextcloud/Classes/UL1IN002/2025-2026/Admin/Examens/Partiel/courseid_3635_participants_202604.csv"
+
+# Option 1: List grade files explicitly
+# grade_files:
+#   - "group1_grades.csv"
+#   - "group2_grades.xlsx"
+#   - "group3_grades.ods"
+
+# Option 2: Point to a directory - all .csv, .xlsx, .ods, .tsv files are picked up
+grade_dir: "/home/francois/Nextcloud/Classes/UL1IN002/2025-2026/Admin/Examens/Partiel/notes/"
+
+# Option 3: Both - files from grade_files + everything in grade_dir (deduplicated)
+# grade_files:
+#   - "late_submission.csv"
+# grade_dir: "ta_grades/"
+
+output_file: "/home/francois/Nextcloud/Classes/UL1IN002/2025-2026/Admin/Examens/Partiel/grades_consolidated.csv"
