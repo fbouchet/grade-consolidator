@@ -390,7 +390,16 @@ def make_name_key(first: str, last: str) -> str:
 # ============================================================================
 
 # Tokens treated as "no grade" (absent, défaillant, …)
-ABSENT_TOKENS = {"ABS", "DEF", "ABJ", "ABI", "ABSENT", "DEFAILLANT", "DÉFAILLANT"}
+ABSENT_TOKENS = {
+    "ABS",
+    "ABSENCE",
+    "ABSENT",
+    "ABJ",
+    "ABI",
+    "DEF",
+    "DEFAILLANT",
+    "DÉFAILLANT",
+}
 
 
 @dataclass

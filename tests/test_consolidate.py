@@ -660,6 +660,11 @@ class TestParseGrade:
         # our code does .upper() comparison
         assert g.is_absent
 
+    def test_absence_full_word(self):
+        g = parse_grade("Absence")
+        assert g.is_absent
+        assert g.value is None
+
     def test_empty_string(self):
         g = parse_grade("")
         assert g.value is None
