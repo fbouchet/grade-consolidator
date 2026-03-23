@@ -44,6 +44,8 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "numero",
         "numero d identification",
         "no d identification",
+        "numero d etudiant",
+        "no d etudiant",
     ],
     "first_name": [
         "prenom",

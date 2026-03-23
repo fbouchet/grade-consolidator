@@ -192,6 +192,9 @@ class TestDetectColumn:
             "Numéro d\u2019identification",
             "Numéro d'identification",
             "N° d'identification",
+            "Numero d'etudiant",
+            "Numéro d'étudiant",
+            "N° d'étudiant",
         ],
     )
     def test_id_variants(self, col_name):
