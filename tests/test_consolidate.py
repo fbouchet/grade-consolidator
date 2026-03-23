@@ -87,6 +87,33 @@ class TestNormalizeText:
     def test_hyphens_become_spaces(self):
         assert normalize_text("Le Bœuf-André") == "le bœuf andre"
 
+    def test_en_dash_becomes_space(self):
+        assert normalize_text("Jean\u2013Pierre") == "jean pierre"
+
+    def test_em_dash_becomes_space(self):
+        assert normalize_text("Jean\u2014Pierre") == "jean pierre"
+
+    def test_double_hyphen_collapses(self):
+        assert normalize_text("Jean--Pierre") == "jean pierre"
+
+    def test_spaced_hyphen_collapses(self):
+        assert normalize_text("Jean- -Pierre") == "jean pierre"
+        assert normalize_text("Jean - Pierre") == "jean pierre"
+
+    def test_all_dash_variants_match_same(self):
+        """All dash variants should normalize to the same result."""
+        expected = "jean pierre"
+        variants = [
+            "Jean-Pierre",
+            "Jean\u2013Pierre",  # en dash
+            "Jean\u2014Pierre",  # em dash
+            "Jean--Pierre",
+            "Jean- -Pierre",
+            "Jean \u2014 Pierre",
+        ]
+        for v in variants:
+            assert normalize_text(v) == expected, f"Failed for: {v!r}"
+
     def test_underscores_become_spaces(self):
         assert normalize_text("first_name") == "first name"
 
@@ -574,6 +601,14 @@ class TestNameNormalization:
         # Note: œ is NOT an accent - it is a ligature and survives normalization
         # This is deliberate: we only strip combining characters, not ligatures.
 
+    def test_dash_variants_all_match(self):
+        """All dash variants in names produce the same key."""
+        key_ref = make_name_key("Jean-Pierre", "Dupont")
+        assert make_name_key("Jean\u2013Pierre", "Dupont") == key_ref  # en dash
+        assert make_name_key("Jean\u2014Pierre", "Dupont") == key_ref  # em dash
+        assert make_name_key("Jean--Pierre", "Dupont") == key_ref
+        assert make_name_key("Jean- -Pierre", "Dupont") == key_ref
+
     def test_make_name_key(self):
         key = make_name_key("Jean-Pierre", "Dupont")
         assert key == "dupont|jean pierre"
@@ -761,6 +796,21 @@ class TestProcessTaFile:
         )
         report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
+
+    def test_match_by_name_dash_variants(self, tmp_path):
+        """Em dash, en dash, double hyphen in names should all match."""
+        # Master has "Le Bœuf-André" (regular hyphen)
+        master = self._setup_master()
+        # TA uses em dash
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Prénom", "Nom", "Note"],
+            [["Éloïse", "Le Bœuf\u2014André", "17"]],
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert report.grades_assigned == 1
+        assert master.by_id["12347"].grade == 17.0
 
     def test_ambiguous_name_skipped(self, tmp_path):
         """Two students with the same name → skip with warning."""

@@ -102,14 +102,19 @@ def normalize_text(text: str) -> str:
     - strip & lowercase
     - replace ° and º with 'o' (French N° = Numéro convention)
     - decompose unicode and drop combining characters (accents)
-    - replace hyphens, underscores, and apostrophes with spaces
-    - collapse whitespace
+    - replace all dash variants (en dash, em dash, etc.), underscores, and
+      apostrophes with spaces
+    - collapse whitespace (this also merges "--", "- -", etc. into one space)
     """
     text = text.strip().lower()
     text = re.sub(r"[°º]", "o", text)
     nfkd = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in nfkd if not unicodedata.combining(c))
-    text = re.sub(r"[-_'\u2018\u2019\u0027\u02BC]", " ", text)
+    text = re.sub(
+        r"[-_'\u2010\u2011\u2012\u2013\u2014\u2015\u2018\u2019\u0027\u02BC]",
+        " ",
+        text,
+    )
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
