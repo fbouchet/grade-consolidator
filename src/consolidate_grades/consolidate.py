@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -320,7 +321,22 @@ def detect_grade_column(
 # 2. FILE READING
 # ============================================================================
 
-_CSV_ENCODINGS = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+_CSV_ENCODINGS = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "utf-7"]
+
+# Pattern for UTF-7 escape sequences like +AOk- (accented chars)
+_UTF7_PATTERN = re.compile(r"\+[A-Za-z0-9+/]+-")
+
+
+def _has_utf7_sequences(df: pd.DataFrame) -> bool:
+    """Check if column names or first row values contain UTF-7 escape sequences."""
+    for col in df.columns:
+        if _UTF7_PATTERN.search(str(col)):
+            return True
+    if len(df) > 0:
+        for val in df.iloc[0]:
+            if pd.notna(val) and _UTF7_PATTERN.search(str(val)):
+                return True
+    return False
 
 
 def read_file(path: str | Path) -> pd.DataFrame:
@@ -358,6 +374,19 @@ def read_file(path: str | Path) -> pd.DataFrame:
             raise ValueError(
                 f"Could not read '{path}' with any of the attempted encodings."
             )
+        # Post-read check: if a non-UTF-7 encoding succeeded but column
+        # names/data contain UTF-7 escape sequences, re-read with UTF-7.
+        if _has_utf7_sequences(df):
+            with contextlib.suppress(UnicodeDecodeError, pd.errors.ParserError):
+                df = clean_column_names(
+                    pd.read_csv(
+                        path,
+                        sep=None,
+                        engine="python",
+                        encoding="utf-7",
+                        dtype=str,
+                    )
+                )
     else:
         raise ValueError(f"Unsupported file extension: '{suffix}' for file '{path}'.")
 

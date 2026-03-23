@@ -590,6 +590,61 @@ class TestReadFile:
         with pytest.raises(ValueError, match="Unsupported file extension"):
             read_file(p)
 
+    def test_csv_utf7_encoding(self, tmp_path):
+        """CSV saved in UTF-7 encoding should be decoded correctly."""
+        p = tmp_path / "data.csv"
+        with open(p, "w", encoding="utf-7") as f:
+            f.write("Prénom,Nom de famille,Numéro,Note\n")
+            f.write("Éloïse,André,12345,15\n")
+        df = read_file(p)
+        assert "Prénom" in df.columns
+        assert df.iloc[0]["Prénom"] == "Éloïse"
+
+    def test_csv_utf7_column_detection(self, tmp_path):
+        """UTF-7 columns should be decoded and detected by alias matching."""
+        p = tmp_path / "data.csv"
+        with open(p, "w", encoding="utf-7") as f:
+            f.write("Prénom,Nom de famille,Numéro,Note\n")
+            f.write("Jean,Dupont,12345,15\n")
+        df = read_file(p)
+        assert detect_column(list(df.columns), "first_name") is not None
+        assert detect_column(list(df.columns), "grade") is not None
+
+    def test_csv_utf7_with_semicolons(self, tmp_path):
+        """UTF-7 with semicolon separators."""
+        p = tmp_path / "data.csv"
+        with open(p, "w", encoding="utf-7") as f:
+            f.write("Prénom;Nom;Numéro;Note\n")
+            f.write("François;Müller;12346;14\n")
+        df = read_file(p)
+        assert "Prénom" in df.columns
+        assert df.iloc[0]["Prénom"] == "François"
+
+    def test_normal_csv_not_broken_by_utf7_detection(self, tmp_path):
+        """Normal UTF-8 CSV with '+' in data should not be misdetected as UTF-7."""
+        p = tmp_path / "data.csv"
+        _write_csv(
+            p,
+            ["Prénom", "Note"],
+            [["Jean+Pierre", "15"]],
+        )
+        df = read_file(p)
+        assert df.iloc[0]["Prénom"] == "Jean+Pierre"
+
+    def test_csv_utf7_integration(self, tmp_path):
+        """Full pipeline: UTF-7 TA file with accented names."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        with open(p, "w", encoding="utf-7") as f:
+            f.write("Prénom,Nom de famille,Numéro étudiant,Note\n")
+            f.write("Jean,Dupont,12345,15\n")
+            f.write("Marie,Curie,12346,14\n")
+        report = process_ta_file(p, master, interactive=False)
+        assert not report.skipped
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 15.0
+        assert master.by_id["12346"].grade == 14.0
+
 
 # ============================================================================
 # 5. Name normalisation
