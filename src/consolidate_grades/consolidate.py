@@ -385,6 +385,76 @@ def make_name_key(first: str, last: str) -> str:
     return f"{normalize_name(last)}|{normalize_name(first)}"
 
 
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute the Levenshtein (edit) distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def name_similarity_hint(dist: int, max_len: int) -> str:
+    """Return a human-readable hint about how similar two names are."""
+    if dist == 0:
+        return "identical"
+    if max_len == 0:
+        return "empty"
+    ratio = dist / max_len
+    if ratio <= 0.15:
+        return "very similar (likely typo)"
+    if ratio <= 0.35:
+        return "somewhat similar"
+    return "very different (possibly wrong student)"
+
+
+def prompt_name_mismatch(
+    sid: str,
+    master_name: str,
+    ta_name: str,
+    filename: str,
+) -> bool:
+    """
+    Interactively ask the user to confirm an ID match despite a name mismatch.
+
+    Shows the edit distance and a similarity hint.
+    Returns True to proceed with the match, False to skip.
+    """
+    norm_master = normalize_name(master_name)
+    norm_ta = normalize_name(ta_name)
+    dist = levenshtein_distance(norm_master, norm_ta)
+    max_len = max(len(norm_master), len(norm_ta))
+    hint = name_similarity_hint(dist, max_len)
+
+    print(f"\n  Name mismatch for ID '{sid}' in '{filename}':")
+    print(f"    Master : {master_name}")
+    print(f"    TA file: {ta_name}")
+    print(f"    Edit distance: {dist} ({hint})")
+
+    while True:
+        try:
+            raw = input("  Proceed with this match? [y/n]: ").strip().lower()
+        except EOFError:
+            print("  Please enter y or n.")
+            continue
+        if raw in ("y", "yes"):
+            print("  -> Confirmed.")
+            return True
+        if raw in ("n", "no"):
+            print("  -> Skipping this student.")
+            return False
+        print("  Please enter y or n.")
+
+
 # ============================================================================
 # 4. GRADE PARSING
 # ============================================================================
@@ -538,6 +608,7 @@ class FileReport:
     warnings: list[str] = field(default_factory=list)
     skipped: bool = False
     new_overrides: dict[str, str] = field(default_factory=dict)
+    new_name_confirmations: list[str] = field(default_factory=list)
 
 
 _ROLE_LABELS = {
@@ -643,16 +714,22 @@ def process_ta_file(
     *,
     interactive: bool = True,
     column_overrides: dict[str, str] | None = None,
+    name_confirmations: list[str] | None = None,
 ) -> FileReport:
     """Process one TA grade file and update the master index in place.
 
     ``column_overrides`` is an optional dict of role -> column name that were
     previously saved from interactive choices.  New interactive choices are
     stored in ``report.new_overrides`` for the caller to persist.
+
+    ``name_confirmations`` is an optional list of student IDs for which a
+    name mismatch was previously confirmed.  New confirmations are stored
+    in ``report.new_name_confirmations``.
     """
     path = Path(path)
     report = FileReport(filename=str(path))
     overrides = column_overrides or {}
+    confirmed_ids = set(name_confirmations or [])
 
     # Read
     try:
@@ -754,12 +831,42 @@ def process_ta_file(
                         got_fn = normalize_name(fn_raw)
                         got_ln = normalize_name(ln_raw)
                         if (got_fn, got_ln) != (expected_fn, expected_ln):
-                            report.warnings.append(
-                                f"  Row {row_idx}: ID '{sid}' matches "
-                                f"'{student.first_name} {student.last_name}' in master, "
-                                f"but TA file says '{fn_raw} {ln_raw}'. "
-                                "Proceeding with ID match — please verify."
-                            )
+                            master_full = f"{student.first_name} {student.last_name}"
+                            ta_full = f"{fn_raw} {ln_raw}"
+
+                            if sid in confirmed_ids:
+                                report.warnings.append(
+                                    f"  Row {row_idx}: ID '{sid}' name mismatch "
+                                    f"(master='{master_full}', "
+                                    f"TA='{ta_full}') — "
+                                    "previously confirmed, proceeding."
+                                )
+                            elif interactive:
+                                confirmed = prompt_name_mismatch(
+                                    sid, master_full, ta_full, path.name
+                                )
+                                if confirmed:
+                                    report.new_name_confirmations.append(sid)
+                                    report.warnings.append(
+                                        f"  Row {row_idx}: ID '{sid}' name "
+                                        f"mismatch confirmed by user."
+                                    )
+                                else:
+                                    report.warnings.append(
+                                        f"  Row {row_idx}: ID '{sid}' name "
+                                        f"mismatch rejected by user. "
+                                        "Skipping row."
+                                    )
+                                    student = None
+                                    continue
+                            else:
+                                report.warnings.append(
+                                    f"  Row {row_idx}: ID '{sid}' matches "
+                                    f"'{master_full}' in master, "
+                                    f"but TA file says '{ta_full}'. "
+                                    "Proceeding with ID match "
+                                    "(non-interactive)."
+                                )
 
                 if student is None and sid:
                     # ID not in master — try name fallback
@@ -1047,8 +1154,9 @@ def consolidate(
     if not grade_file_paths:
         print("WARNING: No grade files found. Output will have no grades.")
 
-    # Load existing column overrides
+    # Load existing column overrides and name confirmations
     all_overrides: dict[str, dict[str, str]] = cfg.get("column_overrides", {})
+    all_name_confirmations: dict[str, list[str]] = cfg.get("name_confirmations", {})
     config_changed = False
 
     # Process TA files
@@ -1056,26 +1164,38 @@ def consolidate(
     for gf_path in grade_file_paths:
         print(f"Processing: {gf_path}")
         file_overrides = all_overrides.get(gf_path.name, {})
+        file_name_confs = all_name_confirmations.get(gf_path.name, [])
         report = process_ta_file(
             gf_path,
             master,
             interactive=interactive,
             column_overrides=file_overrides,
+            name_confirmations=file_name_confs,
         )
         reports.append(report)
 
-        # Collect new overrides from interactive choices
+        # Collect new column overrides from interactive choices
         if report.new_overrides:
             existing = all_overrides.get(gf_path.name, {})
             existing.update(report.new_overrides)
             all_overrides[gf_path.name] = existing
             config_changed = True
 
+        # Collect new name confirmations
+        if report.new_name_confirmations:
+            existing_confs = all_name_confirmations.get(gf_path.name, [])
+            existing_confs.extend(report.new_name_confirmations)
+            all_name_confirmations[gf_path.name] = existing_confs
+            config_changed = True
+
     # Persist overrides back to config if any new choices were made
     if config_changed:
-        cfg["column_overrides"] = all_overrides
+        if all_overrides:
+            cfg["column_overrides"] = all_overrides
+        if all_name_confirmations:
+            cfg["name_confirmations"] = all_name_confirmations
         save_config(config_path, cfg)
-        print(f"\n  Column overrides saved to {config_path}")
+        print(f"\n  Overrides saved to {config_path}")
 
     # Write output
     write_moodle_csv(master, output_path)

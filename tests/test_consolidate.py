@@ -22,14 +22,17 @@ from consolidate_grades.consolidate import (
     detect_column,
     detect_grade_column,
     find_header_row,
+    levenshtein_distance,
     load_config,
     make_name_key,
+    name_similarity_hint,
     normalize_name,
     normalize_text,
     parse_grade,
     process_ta_file,
     promote_header_row,
     prompt_column_choice,
+    prompt_name_mismatch,
     read_file,
     resolve_grade_files,
     write_moodle_csv,
@@ -857,7 +860,7 @@ class TestProcessTaFile:
         report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
-        assert any("please verify" in w.lower() for w in report.warnings)
+        assert any("non-interactive" in w.lower() for w in report.warnings)
 
     def test_duplicate_grade_warning(self, tmp_path):
         """Same student in two TA files → warning, keep first grade."""
@@ -1744,3 +1747,208 @@ class TestColumnOverrides:
         master, reports = consolidate(cfg_path, interactive=False)
         assert master.by_id["S001"].grade == 15.0
         assert any("saved override" in w.lower() for w in reports[0].warnings)
+
+
+# ============================================================================
+# 18. Levenshtein distance and name similarity
+# ============================================================================
+
+
+class TestLevenshteinDistance:
+    def test_identical(self):
+        assert levenshtein_distance("hello", "hello") == 0
+
+    def test_single_substitution(self):
+        assert levenshtein_distance("Dupont", "Dupond") == 1
+
+    def test_single_insertion(self):
+        assert levenshtein_distance("Marin", "Martin") == 1
+
+    def test_single_deletion(self):
+        assert levenshtein_distance("Martin", "Marin") == 1
+
+    def test_empty_strings(self):
+        assert levenshtein_distance("", "") == 0
+        assert levenshtein_distance("abc", "") == 3
+        assert levenshtein_distance("", "abc") == 3
+
+    def test_completely_different(self):
+        assert levenshtein_distance("abc", "xyz") == 3
+
+    def test_symmetric(self):
+        assert levenshtein_distance("a", "ab") == levenshtein_distance("ab", "a")
+
+
+class TestNameSimilarityHint:
+    def test_identical(self):
+        assert "identical" in name_similarity_hint(0, 10)
+
+    def test_likely_typo(self):
+        hint = name_similarity_hint(1, 12)
+        assert "typo" in hint
+
+    def test_very_different(self):
+        hint = name_similarity_hint(8, 10)
+        assert "different" in hint
+
+    def test_empty(self):
+        # dist=0, max_len=0: both strings empty → identical
+        assert "identical" in name_similarity_hint(0, 0)
+
+
+# ============================================================================
+# 19. Name mismatch confirmation
+# ============================================================================
+
+
+class TestNameMismatchConfirmation:
+    def test_prompt_confirm(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        result = prompt_name_mismatch("12345", "Jean Dupont", "Jean Dupond", "ta.csv")
+        assert result is True
+
+    def test_prompt_reject(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        result = prompt_name_mismatch("12345", "Jean Dupont", "Jean Dupond", "ta.csv")
+        assert result is False
+
+    def test_prompt_invalid_then_valid(self, monkeypatch):
+        inputs = iter(["maybe", "x", "y"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        result = prompt_name_mismatch("12345", "Jean Dupont", "Jean Dupond", "ta.csv")
+        assert result is True
+
+    def test_interactive_confirm_assigns_grade(self, tmp_path, monkeypatch):
+        """Name mismatch + user confirms → grade assigned."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupond", "15"]],  # Dupond ≠ Dupont
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        report = process_ta_file(p, master, interactive=True)
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert "12345" in report.new_name_confirmations
+        assert any("confirmed" in w.lower() for w in report.warnings)
+
+    def test_interactive_reject_skips_student(self, tmp_path, monkeypatch):
+        """Name mismatch + user rejects → student skipped."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Pierre", "Martin", "15"]],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        report = process_ta_file(p, master, interactive=True)
+        assert report.grades_assigned == 0
+        assert master.by_id["12345"].grade is None
+        assert any("rejected" in w.lower() for w in report.warnings)
+
+    def test_non_interactive_proceeds_silently(self, tmp_path):
+        """Non-interactive mode proceeds with warning on name mismatch."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupond", "15"]],
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert any("non-interactive" in w.lower() for w in report.warnings)
+
+    def test_saved_confirmation_skips_prompt(self, tmp_path):
+        """Previously confirmed name mismatch doesn't re-prompt."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupond", "15"]],
+        )
+        # No monkeypatch needed — should not prompt
+        report = process_ta_file(
+            p,
+            master,
+            interactive=True,
+            name_confirmations=["12345"],
+        )
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert any("previously confirmed" in w.lower() for w in report.warnings)
+
+    def test_confirmation_persisted_to_yaml(self, tmp_path, monkeypatch):
+        """Interactive name confirmation saved to config YAML."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [["S001", "Alice", "Martin", "alice@univ.fr"]],
+        )
+
+        ta_path = tmp_path / "ta.csv"
+        _write_csv(
+            ta_path,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["S001", "Alice", "Martine", "16"]],  # Martine ≠ Martin
+        )
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["ta.csv"],
+                    "output_file": "out.csv",
+                }
+            )
+        )
+
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        consolidate(cfg_path, interactive=True)
+
+        # Re-read config
+        with open(cfg_path, encoding="utf-8") as f:
+            saved_cfg = yaml.safe_load(f)
+        assert "name_confirmations" in saved_cfg
+        assert "ta.csv" in saved_cfg["name_confirmations"]
+        assert "S001" in saved_cfg["name_confirmations"]["ta.csv"]
+
+    def test_saved_confirmation_reused_on_rerun(self, tmp_path):
+        """On second run, saved name confirmation skips the prompt."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [["S001", "Alice", "Martin", "alice@univ.fr"]],
+        )
+
+        ta_path = tmp_path / "ta.csv"
+        _write_csv(
+            ta_path,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["S001", "Alice", "Martine", "16"]],
+        )
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["ta.csv"],
+                    "output_file": "out.csv",
+                    "name_confirmations": {"ta.csv": ["S001"]},
+                }
+            )
+        )
+
+        # No monkeypatch — should not prompt
+        master, reports = consolidate(cfg_path, interactive=False)
+        assert master.by_id["S001"].grade == 16.0
+        assert any("previously confirmed" in w.lower() for w in reports[0].warnings)
