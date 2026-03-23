@@ -16,6 +16,7 @@ from consolidate_grades.consolidate import (
     build_master_index,
     clean_column_names,
     consolidate,
+    detect_all_columns,
     detect_column,
     detect_grade_column,
     find_header_row,
@@ -30,6 +31,7 @@ from consolidate_grades.consolidate import (
     prompt_column_choice,
     read_file,
     resolve_grade_files,
+    save_config,
     write_moodle_csv,
 )
 
@@ -44,6 +46,7 @@ __all__ = [
     "build_master_index",
     "clean_column_names",
     "consolidate",
+    "detect_all_columns",
     "detect_column",
     "detect_grade_column",
     "find_header_row",
@@ -58,5 +61,6 @@ __all__ = [
     "prompt_column_choice",
     "read_file",
     "resolve_grade_files",
+    "save_config",
     "write_moodle_csv",
 ]

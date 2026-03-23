@@ -18,6 +18,7 @@ from consolidate_grades.consolidate import (
     build_master_index,
     clean_column_names,
     consolidate,
+    detect_all_columns,
     detect_column,
     detect_grade_column,
     find_header_row,
@@ -1523,3 +1524,218 @@ class TestPromptColumnChoice:
         report = process_ta_file(p, master, interactive=True)
         assert report.skipped
         assert master.by_id["12345"].grade is None
+
+
+# ============================================================================
+# 15. detect_all_columns
+# ============================================================================
+
+
+class TestDetectAllColumns:
+    def test_single_match(self):
+        cols = ["Numéro étudiant", "Prénom", "Note"]
+        assert detect_all_columns(cols, "id") == ["Numéro étudiant"]
+
+    def test_multiple_matches(self):
+        cols = ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"]
+        matches = detect_all_columns(cols, "id")
+        assert "Numero" in matches
+        assert "Numero etudiant" in matches
+        assert len(matches) == 2
+
+    def test_no_match(self):
+        assert detect_all_columns(["Foo", "Bar"], "id") == []
+
+
+# ============================================================================
+# 16. Ambiguous ID column with interactive prompt
+# ============================================================================
+
+
+class TestAmbiguousIdColumn:
+    def test_ambiguous_id_interactive_select(self, tmp_path, monkeypatch):
+        """When two ID columns exist, user picks the right one."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
+            [["1", "Jean", "Dupont", "12345", "15"]],
+        )
+        # "Numero" and "Numero etudiant" both match ID.
+        # User selects "Numero etudiant" (option 2)
+        monkeypatch.setattr("builtins.input", lambda _: "2")
+        report = process_ta_file(p, master, interactive=True)
+        assert not report.skipped
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert "id" in report.new_overrides
+        assert report.new_overrides["id"] == "Numero etudiant"
+
+    def test_ambiguous_id_non_interactive_uses_first(self, tmp_path):
+        """Non-interactive mode uses the first match."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
+            [["12345", "Jean", "Dupont", "12345", "15"]],
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert not report.skipped
+        # First match "Numero" was used - happens to work here since
+        # we set the same value in both columns
+        assert report.grades_assigned == 1
+
+    def test_ambiguous_id_skip_falls_back_to_name(self, tmp_path, monkeypatch):
+        """User skips ID selection — falls back to name matching."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
+            [["1", "Jean", "Dupont", "12345", "15"]],
+        )
+        # User selects skip (option 3) for ID
+        monkeypatch.setattr("builtins.input", lambda _: "3")
+        report = process_ta_file(p, master, interactive=True)
+        # Should still work via name matching
+        assert not report.skipped
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+
+
+# ============================================================================
+# 17. Column overrides (YAML persistence)
+# ============================================================================
+
+
+class TestColumnOverrides:
+    def test_override_applied(self, tmp_path):
+        """Column override bypasses detection."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
+            [["1", "Jean", "Dupont", "12345", "15"]],
+        )
+        report = process_ta_file(
+            p,
+            master,
+            interactive=False,
+            column_overrides={"id": "Numero etudiant"},
+        )
+        assert not report.skipped
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert any("saved override" in w.lower() for w in report.warnings)
+
+    def test_override_for_grade(self, tmp_path):
+        """Grade override bypasses detection."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Note /23", "Note /20"],
+            [["12345", "18", "15"]],
+        )
+        report = process_ta_file(
+            p,
+            master,
+            interactive=False,
+            column_overrides={"grade": "Note /20"},
+        )
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+
+    def test_override_missing_column_falls_back(self, tmp_path):
+        """Override pointing to a nonexistent column falls back to detection."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Note"],
+            [["12345", "15"]],
+        )
+        report = process_ta_file(
+            p,
+            master,
+            interactive=False,
+            column_overrides={"grade": "Nonexistent Column"},
+        )
+        # Should fall back to detecting "Note"
+        assert not report.skipped
+        assert report.grades_assigned == 1
+        assert any("not found in columns" in w.lower() for w in report.warnings)
+
+    def test_overrides_persisted_to_yaml(self, tmp_path, monkeypatch):
+        """Interactive choices are saved to the YAML config."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [["S001", "Alice", "Martin", "alice@univ.fr"]],
+        )
+
+        ta_path = tmp_path / "ta.csv"
+        _write_csv(
+            ta_path,
+            ["Numéro étudiant", "Note /23", "Note /20"],
+            [["S001", "18", "15"]],
+        )
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["ta.csv"],
+                    "output_file": "out.csv",
+                }
+            )
+        )
+
+        # User selects "Note /20" (option 2)
+        monkeypatch.setattr("builtins.input", lambda _: "2")
+        consolidate(cfg_path, interactive=True)
+
+        # Re-read config — overrides should be saved
+        with open(cfg_path, encoding="utf-8") as f:
+            saved_cfg = yaml.safe_load(f)
+        assert "column_overrides" in saved_cfg
+        assert "ta.csv" in saved_cfg["column_overrides"]
+        assert saved_cfg["column_overrides"]["ta.csv"]["grade"] == "Note /20"
+
+    def test_saved_overrides_reused_on_rerun(self, tmp_path):
+        """On second run, saved overrides skip the prompt."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [["S001", "Alice", "Martin", "alice@univ.fr"]],
+        )
+
+        ta_path = tmp_path / "ta.csv"
+        _write_csv(
+            ta_path,
+            ["Numéro étudiant", "Note /23", "Note /20"],
+            [["S001", "18", "15"]],
+        )
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["ta.csv"],
+                    "output_file": "out.csv",
+                    "column_overrides": {"ta.csv": {"grade": "Note /20"}},
+                }
+            )
+        )
+
+        # Should work without any interactive input
+        master, reports = consolidate(cfg_path, interactive=False)
+        assert master.by_id["S001"].grade == 15.0
+        assert any("saved override" in w.lower() for w in reports[0].warnings)

@@ -191,19 +191,25 @@ def promote_header_row(df: pd.DataFrame, row_idx: int) -> pd.DataFrame:
 
 def detect_column(columns: list[str], role: str) -> str | None:
     """
-    Given a list of DataFrame column names, return the *original* column name
-    that best matches the semantic ``role`` (e.g. "id", "first_name", …).
-    Returns ``None`` if no match found.
+    Given a list of DataFrame column names, return the *first* column name
+    that matches the semantic ``role``.  Returns ``None`` if no match found.
 
-    Exact-match on normalised aliases has priority.  For "last_name" vs a bare
-    "nom", we need special handling since "nom" is very short and could be a
-    prefix of other things - but in practice it is an exact alias so it works.
+    Use ``detect_all_columns`` when you need to detect ambiguity.
     """
     aliases = {normalize_text(a) for a in COLUMN_ALIASES.get(role, [])}
     for col in columns:
         if normalize_text(col) in aliases:
             return col
     return None
+
+
+def detect_all_columns(columns: list[str], role: str) -> list[str]:
+    """
+    Return *all* column names that match the semantic ``role``.
+    Used to detect ambiguity (e.g. both 'Numero' and 'Numero etudiant').
+    """
+    aliases = {normalize_text(a) for a in COLUMN_ALIASES.get(role, [])}
+    return [col for col in columns if normalize_text(col) in aliases]
 
 
 def detect_grade_column(
@@ -522,22 +528,35 @@ class FileReport:
     grades_assigned: int = 0
     warnings: list[str] = field(default_factory=list)
     skipped: bool = False
+    new_overrides: dict[str, str] = field(default_factory=dict)
 
 
-def prompt_column_choice(candidates: list[str], filename: str) -> str | None:
+_ROLE_LABELS = {
+    "id": "student ID",
+    "first_name": "first name",
+    "last_name": "last name",
+    "email": "email",
+    "grade": "grade",
+}
+
+
+def prompt_column_choice(
+    candidates: list[str], filename: str, role: str = "grade"
+) -> str | None:
     """
-    Interactively ask the user to choose among ambiguous grade column candidates.
+    Interactively ask the user to choose among ambiguous column candidates.
 
     Returns the chosen column name, or None if the user chooses to skip.
     """
-    print(f"\n  Multiple grade columns detected in '{filename}':")
+    label = _ROLE_LABELS.get(role, role)
+    print(f"\n  Multiple {label} columns detected in '{filename}':")
     for i, col in enumerate(candidates, 1):
         print(f"    {i}. {col}")
     print(f"    {len(candidates) + 1}. Skip this file")
 
     while True:
         try:
-            raw = input(f"  Choose column [1-{len(candidates) + 1}]: ").strip()
+            raw = input(f"  Choose {label} column [1-{len(candidates) + 1}]: ").strip()
             choice = int(raw)
         except (ValueError, EOFError):
             print("  Please enter a valid number.")
@@ -553,12 +572,78 @@ def prompt_column_choice(candidates: list[str], filename: str) -> str | None:
             print(f"  Please enter a number between 1 and {len(candidates) + 1}.")
 
 
+def _resolve_column(
+    role: str,
+    cols: list[str],
+    overrides: dict[str, str],
+    filename: str,
+    interactive: bool,
+    report: FileReport,
+) -> tuple[str | None, dict[str, str]]:
+    """
+    Resolve a column for a given role, checking overrides first, then
+    detecting, and prompting on ambiguity.
+
+    Returns (column_name_or_None, new_overrides_to_save).
+    """
+    new_overrides: dict[str, str] = {}
+
+    # 1. Check override
+    if role in overrides:
+        override_col = overrides[role]
+        if override_col in cols:
+            label = _ROLE_LABELS.get(role, role)
+            report.warnings.append(
+                f"  Using saved override for {label}: '{override_col}'."
+            )
+            return override_col, new_overrides
+        report.warnings.append(
+            f"  Saved override '{override_col}' for {role} not found in columns. "
+            "Falling back to detection."
+        )
+
+    # 2. Detect
+    matches = detect_all_columns(cols, role)
+
+    if len(matches) == 1:
+        return matches[0], new_overrides
+    elif len(matches) == 0:
+        return None, new_overrides
+    else:
+        # Ambiguous
+        label = _ROLE_LABELS.get(role, role)
+        report.warnings.append(f"  AMBIGUOUS: multiple {label} columns: {matches}.")
+        if interactive:
+            chosen = prompt_column_choice(matches, filename, role)
+            if chosen is not None:
+                report.warnings.append(
+                    f"  {label.capitalize()} column manually selected: '{chosen}'."
+                )
+                new_overrides[role] = chosen
+            return chosen, new_overrides
+        # Non-interactive: use first match
+        report.warnings.append(
+            f"  Using first match: '{matches[0]}' (non-interactive mode)."
+        )
+        return matches[0], new_overrides
+
+
 def process_ta_file(
-    path: str | Path, master: MasterIndex, *, interactive: bool = True
+    path: str | Path,
+    master: MasterIndex,
+    *,
+    interactive: bool = True,
+    column_overrides: dict[str, str] | None = None,
 ) -> FileReport:
-    """Process one TA grade file and update the master index in place."""
+    """Process one TA grade file and update the master index in place.
+
+    ``column_overrides`` is an optional dict of role -> column name that were
+    previously saved from interactive choices.  New interactive choices are
+    stored in ``report.new_overrides`` for the caller to persist.
+    """
     path = Path(path)
     report = FileReport(filename=str(path))
+    overrides = column_overrides or {}
 
     # Read
     try:
@@ -575,24 +660,54 @@ def process_ta_file(
 
     cols = list(df.columns)
 
-    # Detect columns
-    id_col = detect_column(cols, "id")
-    fn_col = detect_column(cols, "first_name")
-    ln_col = detect_column(cols, "last_name")
+    # Detect columns with override + ambiguity support
+    id_col, id_ov = _resolve_column(
+        "id", cols, overrides, path.name, interactive, report
+    )
+    fn_col, fn_ov = _resolve_column(
+        "first_name", cols, overrides, path.name, interactive, report
+    )
+    ln_col, ln_ov = _resolve_column(
+        "last_name", cols, overrides, path.name, interactive, report
+    )
 
     known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
 
-    grade_col, gw, ambiguous = detect_grade_column(df, known_cols)
-    report.warnings.extend(gw)
+    # Grade column: check override first, then use the advanced detection
+    grade_col: str | None = None
+    grade_ov: dict[str, str] = {}
 
-    if grade_col is None and ambiguous and interactive:
-        grade_col = prompt_column_choice(ambiguous, path.name)
-        if grade_col is not None:
-            report.warnings.append(f"  Grade column manually selected: '{grade_col}'.")
+    if "grade" in overrides:
+        override_grade = overrides["grade"]
+        if override_grade in cols:
+            report.warnings.append(
+                f"  Using saved override for grade: '{override_grade}'."
+            )
+            grade_col = override_grade
+        else:
+            report.warnings.append(
+                f"  Saved override '{override_grade}' for grade not found "
+                "in columns. Falling back to detection."
+            )
+
+    if grade_col is None:
+        grade_col, gw, ambiguous = detect_grade_column(df, known_cols)
+        report.warnings.extend(gw)
+
+        if grade_col is None and ambiguous and interactive:
+            grade_col = prompt_column_choice(ambiguous, path.name, "grade")
+            if grade_col is not None:
+                report.warnings.append(
+                    f"  Grade column manually selected: '{grade_col}'."
+                )
+                grade_ov["grade"] = grade_col
 
     if grade_col is None:
         report.skipped = True
         return report
+
+    # Collect all new overrides for persistence
+    report.new_overrides = {**id_ov, **fn_ov, **ln_ov, **grade_ov}
 
     # Determine matching strategy
     use_id = id_col is not None
@@ -877,6 +992,13 @@ def load_config(config_path: str | Path) -> dict:
     return cfg
 
 
+def save_config(config_path: str | Path, cfg: dict) -> None:
+    """Write the config dict back to the YAML file, preserving new overrides."""
+    config_path = Path(config_path)
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
 def consolidate(
     config_path: str | Path, *, interactive: bool = True
 ) -> tuple[MasterIndex, list[FileReport]]:
@@ -916,12 +1038,35 @@ def consolidate(
     if not grade_file_paths:
         print("WARNING: No grade files found. Output will have no grades.")
 
+    # Load existing column overrides
+    all_overrides: dict[str, dict[str, str]] = cfg.get("column_overrides", {})
+    config_changed = False
+
     # Process TA files
     reports: list[FileReport] = []
     for gf_path in grade_file_paths:
         print(f"Processing: {gf_path}")
-        report = process_ta_file(gf_path, master, interactive=interactive)
+        file_overrides = all_overrides.get(gf_path.name, {})
+        report = process_ta_file(
+            gf_path,
+            master,
+            interactive=interactive,
+            column_overrides=file_overrides,
+        )
         reports.append(report)
+
+        # Collect new overrides from interactive choices
+        if report.new_overrides:
+            existing = all_overrides.get(gf_path.name, {})
+            existing.update(report.new_overrides)
+            all_overrides[gf_path.name] = existing
+            config_changed = True
+
+    # Persist overrides back to config if any new choices were made
+    if config_changed:
+        cfg["column_overrides"] = all_overrides
+        save_config(config_path, cfg)
+        print(f"\n  Column overrides saved to {config_path}")
 
     # Write output
     write_moodle_csv(master, output_path)
