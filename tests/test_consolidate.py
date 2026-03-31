@@ -34,6 +34,7 @@ from consolidate_grades.consolidate import (
     prompt_column_choice,
     prompt_name_mismatch,
     read_file,
+    read_file_sheets,
     resolve_grade_files,
     write_moodle_csv,
 )
@@ -245,6 +246,7 @@ class TestDetectColumn:
             "Note finale",
             "Total",
             "Total général",
+            "Notes",
         ],
     )
     def test_grade_variants(self, col_name):
@@ -315,6 +317,13 @@ class TestDetectGradeColumn:
         df = pd.DataFrame({"ID": ["1"], "Note /23": ["18"]})
         col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
         assert col == "Note /23"
+
+    def test_prefix_match_notes_sur(self):
+        """'Notes sur 23' detected via prefix on 'notes' alias."""
+        df = pd.DataFrame({"Numéro étudiant": ["1"], "Notes sur 23": ["15"]})
+        col, warnings, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
+        assert col == "Notes sur 23"
+        assert any("prefix" in w.lower() for w in warnings)
 
     def test_total_column_with_subscores(self):
         """'Total' preferred over Q1-Q14 sub-score columns via exact alias."""
@@ -647,8 +656,142 @@ class TestReadFile:
 
 
 # ============================================================================
-# 5. Name normalisation
+# 4b. Multi-sheet reading
 # ============================================================================
+
+
+class TestMultiSheet:
+    def test_xlsx_single_sheet(self, tmp_path):
+        """XLSX with one sheet returns that sheet."""
+        p = tmp_path / "data.xlsx"
+        pd.DataFrame({"Numéro étudiant": ["1"], "Note": ["15"]}).to_excel(
+            p, index=False, engine="openpyxl"
+        )
+        sheets = read_file_sheets(p)
+        assert len(sheets) == 1
+
+    def test_xlsx_multi_sheet(self, tmp_path):
+        """XLSX with multiple grade sheets returns all of them."""
+        p = tmp_path / "data.xlsx"
+        with pd.ExcelWriter(p, engine="openpyxl") as writer:
+            pd.DataFrame(
+                {"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}
+            ).to_excel(writer, sheet_name="DC-1", index=False)
+            pd.DataFrame(
+                {"Numéro étudiant": ["2"], "Prénom": ["B"], "Note": ["14"]}
+            ).to_excel(writer, sheet_name="DC-2", index=False)
+        sheets = read_file_sheets(p)
+        assert len(sheets) == 2
+        names = [name for name, _ in sheets]
+        assert "DC-1" in names
+        assert "DC-2" in names
+
+    def test_xlsx_multi_sheet_skips_non_grade_sheets(self, tmp_path):
+        """Sheets without grade-like columns are skipped."""
+        p = tmp_path / "data.xlsx"
+        with pd.ExcelWriter(p, engine="openpyxl") as writer:
+            pd.DataFrame(
+                {"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}
+            ).to_excel(writer, sheet_name="Grades", index=False)
+            pd.DataFrame({"Foo": ["bar"], "Baz": ["qux"]}).to_excel(
+                writer, sheet_name="Metadata", index=False
+            )
+        sheets = read_file_sheets(p)
+        assert len(sheets) == 1
+        assert sheets[0][0] == "Grades"
+
+    def test_ods_multi_sheet(self, tmp_path):
+        """ODS with multiple grade sheets."""
+        p = tmp_path / "data.ods"
+        with pd.ExcelWriter(p, engine="odf") as writer:
+            pd.DataFrame(
+                {"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}
+            ).to_excel(writer, sheet_name="Group1", index=False)
+            pd.DataFrame(
+                {"Numéro étudiant": ["2"], "Prénom": ["B"], "Note": ["14"]}
+            ).to_excel(writer, sheet_name="Group2", index=False)
+        sheets = read_file_sheets(p)
+        assert len(sheets) == 2
+
+    def test_csv_returns_single_sheet(self, tmp_path):
+        """CSV files always return exactly one sheet."""
+        p = tmp_path / "data.csv"
+        _write_csv(p, ["Numéro étudiant", "Note"], [["1", "15"]])
+        sheets = read_file_sheets(p)
+        assert len(sheets) == 1
+        assert sheets[0][0] == ""
+
+    def test_multi_sheet_integration(self, tmp_path):
+        """Full pipeline: XLSX with 2 sheets, both processed."""
+        master = _build_master()
+        p = tmp_path / "ta.xlsx"
+        with pd.ExcelWriter(p, engine="openpyxl") as writer:
+            pd.DataFrame(
+                {"Numéro étudiant": ["12345"], "Prénom": ["Jean"], "Note": ["15"]}
+            ).to_excel(writer, sheet_name="DC-1", index=False)
+            pd.DataFrame(
+                {"Numéro étudiant": ["12346"], "Prénom": ["Marie"], "Note": ["14"]}
+            ).to_excel(writer, sheet_name="DC-2", index=False)
+        report = process_ta_file(p, master, interactive=False)
+        assert not report.skipped
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 15.0
+        assert master.by_id["12346"].grade == 14.0
+        assert any("2 sheets" in w for w in report.warnings)
+
+    def test_multi_sheet_with_metadata_sheet(self, tmp_path):
+        """Only grade-like sheets are processed, metadata ignored."""
+        master = _build_master()
+        p = tmp_path / "ta.xlsx"
+        with pd.ExcelWriter(p, engine="openpyxl") as writer:
+            pd.DataFrame(
+                {"Numéro étudiant": ["12345"], "Prénom": ["Jean"], "Note": ["15"]}
+            ).to_excel(writer, sheet_name="Notes", index=False)
+            pd.DataFrame({"Info": ["Correcteur"], "Valeur": ["M. Dupond"]}).to_excel(
+                writer, sheet_name="Info", index=False
+            )
+        report = process_ta_file(p, master, interactive=False)
+        assert not report.skipped
+        assert report.grades_assigned == 1
+
+
+# ============================================================================
+# 4c. Apostrophe-like character edge cases
+# ============================================================================
+
+
+class TestApostropheEdgeCases:
+    def test_win1252_control_char(self):
+        """U+0092 (C1 control, from latin-1 misread of cp1252) stripped as space."""
+        assert (
+            normalize_text("Num\u0092ro d\u0092identification")
+            == "num ro d identification"
+        )
+
+    def test_acute_accent_as_apostrophe(self):
+        """U+00B4 acute accent used as apostrophe."""
+        assert (
+            normalize_text("Numéro d\u00b4identification") == "numero d identification"
+        )
+
+    def test_prime_as_apostrophe(self):
+        """U+2032 prime used as apostrophe."""
+        assert normalize_text("d\u2032identification") == "d identification"
+
+    def test_fullwidth_apostrophe(self):
+        """U+FF07 fullwidth apostrophe."""
+        assert normalize_text("d\uff07identification") == "d identification"
+
+    def test_csv_with_win1252_apostrophe(self, tmp_path):
+        """CSV with Win-1252 apostrophe in column name should detect ID."""
+        p = tmp_path / "ta.csv"
+        # Write with cp1252: é is 0xE9, apostrophe is 0x92
+        with open(p, "wb") as f:
+            f.write("Numéro d\u2019identification;Notes sur 23\n".encode("cp1252"))
+            f.write("12345;15\n".encode("cp1252"))
+        df = read_file(p)
+        col = detect_column(list(df.columns), "id")
+        assert col is not None
 
 
 class TestNameNormalization:

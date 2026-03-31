@@ -81,6 +81,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     ],
     "grade": [
         "note",
+        "notes",
         "grade",
         "score",
         "resultat",
@@ -103,18 +104,31 @@ def normalize_text(text: str) -> str:
     """
     Normalise a string for matching purposes:
     - strip & lowercase
+    - strip C1 control characters (U+0080-U+009F) that can leak from
+      latin-1 misreads of cp1252 files
     - replace ° and º with 'o' (French N° = Numéro convention)
     - decompose unicode and drop combining characters (accents)
-    - replace all dash variants (en dash, em dash, etc.), underscores, and
-      apostrophes with spaces
+    - replace all dash variants, underscores, and apostrophe-like characters
+      with spaces
     - collapse whitespace (this also merges "--", "- -", etc. into one space)
     """
     text = text.strip().lower()
+    text = re.sub(r"[\u0080-\u009F]", " ", text)  # strip C1 controls
     text = re.sub(r"[°º]", "o", text)
     nfkd = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in nfkd if not unicodedata.combining(c))
+    # Dashes: hyphen-minus, hyphen, non-breaking hyphen, figure dash,
+    #         en dash, em dash, horizontal bar
+    # Apostrophes: ASCII quote, grave accent, acute accent, curly quotes,
+    #              primes, modifier letters, fullwidth
     text = re.sub(
-        r"[-_'\u2010\u2011\u2012\u2013\u2014\u2015\u2018\u2019\u0027\u02BC]",
+        r"[-_"
+        r"\u2010\u2011\u2012\u2013\u2014\u2015"  # dashes
+        r"'\u0060\u00B4"  # basic apostrophes + acute
+        r"\u2018\u2019\u201A\u201B"  # curly quotes
+        r"\u2032\u2035\u02B9\u02BC"  # primes + modifiers
+        r"\uFF07"  # fullwidth
+        r"]",
         " ",
         text,
     )
@@ -321,7 +335,7 @@ def detect_grade_column(
 # 2. FILE READING
 # ============================================================================
 
-_CSV_ENCODINGS = ["utf-8", "utf-8-sig", "latin-1", "cp1252", "utf-7"]
+_CSV_ENCODINGS = ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-7"]
 
 # Pattern for UTF-7 escape sequences like +AOk- (accented chars)
 _UTF7_PATTERN = re.compile(r"\+[A-Za-z0-9+/]+-")
@@ -339,12 +353,77 @@ def _has_utf7_sequences(df: pd.DataFrame) -> bool:
     return False
 
 
+def _read_single_sheet(path: Path, engine: str, sheet: str | int = 0) -> pd.DataFrame:
+    """Read a single sheet from an Excel file and apply standard cleaning."""
+    df = clean_column_names(
+        pd.read_excel(path, engine=engine, sheet_name=sheet, dtype=str)
+    )
+    header_row = find_header_row(df)
+    if header_row is not None:
+        df = clean_column_names(promote_header_row(df, header_row))
+    return df
+
+
+def _sheet_looks_like_grades(df: pd.DataFrame) -> bool:
+    """Check if a sheet has enough alias matches to be grade data."""
+    if df.empty or len(df) == 0:
+        return False
+    return (
+        _count_alias_matches(
+            [str(c) for c in df.columns if str(c).strip() and str(c).lower() != "nan"]
+        )
+        >= 2
+    )
+
+
+def read_file_sheets(
+    path: str | Path,
+) -> list[tuple[str, pd.DataFrame]]:
+    """
+    Read a file and return a list of (sheet_name, DataFrame) pairs.
+
+    For CSV files, returns a single pair with sheet_name="".
+    For XLSX/ODS files, returns all sheets that look like grade data
+    (i.e. have at least 2 column alias matches).
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+
+    if suffix in (".csv", ".tsv", ".txt"):
+        return [("", read_file(path))]
+
+    if suffix == ".xlsx":
+        engine = "openpyxl"
+    elif suffix == ".ods":
+        engine = "odf"
+    else:
+        raise ValueError(f"Unsupported file extension: '{suffix}' for file '{path}'.")
+
+    xls = pd.ExcelFile(path, engine=engine)
+    sheet_names = xls.sheet_names
+
+    if len(sheet_names) == 1:
+        df = _read_single_sheet(path, engine, sheet_names[0])
+        return [(sheet_names[0], df)]
+
+    result: list[tuple[str, pd.DataFrame]] = []
+    for name in sheet_names:
+        df = _read_single_sheet(path, engine, name)
+        if _sheet_looks_like_grades(df):
+            result.append((name, df))
+
+    return result
+
+
 def read_file(path: str | Path) -> pd.DataFrame:
     """
     Read a tabular file (.csv, .xlsx, .ods) into a DataFrame.
 
     CSV: tries several encodings and auto-detects the delimiter via the
     Python csv sniffer (``sep=None, engine='python'``).
+
+    XLSX/ODS: reads the first sheet only (use ``read_file_sheets`` for
+    multi-sheet support).
 
     All formats: column names are cleaned of BOM markers and zero-width
     characters after reading.  If the first row doesn't look like headers
@@ -762,219 +841,246 @@ def process_ta_file(
     overrides = column_overrides or {}
     confirmed_ids = set(name_confirmations or [])
 
-    # Read
+    # Read all sheets (CSV returns one sheet with name "")
     try:
-        df = read_file(path)
+        sheets = read_file_sheets(path)
     except Exception as e:
         report.warnings.append(f"  Could not read file: {e}")
         report.skipped = True
         return report
 
-    if df.empty:
-        report.warnings.append("  File is empty.")
+    if not sheets:
+        report.warnings.append("  No valid sheets found in file.")
         report.skipped = True
         return report
 
-    cols = list(df.columns)
-
-    # Detect columns with override + ambiguity support
-    id_col, id_ov = _resolve_column(
-        "id", cols, overrides, path.name, interactive, report
-    )
-    fn_col, fn_ov = _resolve_column(
-        "first_name", cols, overrides, path.name, interactive, report
-    )
-    ln_col, ln_ov = _resolve_column(
-        "last_name", cols, overrides, path.name, interactive, report
-    )
-
-    known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
-
-    # Grade column: check override first, then use the advanced detection
-    grade_col: str | None = None
-    grade_ov: dict[str, str] = {}
-
-    if "grade" in overrides:
-        override_grade = overrides["grade"]
-        if override_grade in cols:
-            report.warnings.append(
-                f"  Using saved override for grade: '{override_grade}'."
-            )
-            grade_col = override_grade
-        else:
-            report.warnings.append(
-                f"  Saved override '{override_grade}' for grade not found "
-                "in columns. Falling back to detection."
-            )
-
-    if grade_col is None:
-        grade_col, gw, ambiguous = detect_grade_column(df, known_cols)
-        report.warnings.extend(gw)
-
-        if grade_col is None and ambiguous and interactive:
-            grade_col = prompt_column_choice(ambiguous, path.name, "grade")
-            if grade_col is not None:
-                report.warnings.append(
-                    f"  Grade column manually selected: '{grade_col}'."
-                )
-                grade_ov["grade"] = grade_col
-
-    if grade_col is None:
-        report.skipped = True
-        return report
-
-    # Collect all new overrides for persistence
-    report.new_overrides = {**id_ov, **fn_ov, **ln_ov, **grade_ov}
-
-    # Determine matching strategy
-    use_id = id_col is not None
-    use_name = fn_col is not None and ln_col is not None
-
-    if not use_id and not use_name:
+    if len(sheets) > 1:
+        sheet_names = [name for name, _ in sheets]
         report.warnings.append(
-            "  File has neither a student ID column nor both first/last name "
-            "columns. Cannot match students. Skipping."
+            f"  Found {len(sheets)} sheets with grade data: {sheet_names}."
         )
-        report.skipped = True
-        return report
 
-    # Process each row
-    for row_idx, row in df.iterrows():
-        raw_grade = row.get(grade_col)
-        parsed = parse_grade(raw_grade)
+    all_new_overrides: dict[str, str] = {}
 
-        student: Student | None = None
-        match_desc = ""
+    for sheet_name, df in sheets:
+        sheet_label = f" [sheet '{sheet_name}']" if sheet_name else ""
 
-        if use_id:
-            sid = str(row[id_col]).strip()
-            if sid and sid.lower() != "nan":
-                student = master.by_id.get(sid)
-                match_desc = f"ID={sid}"
+        if df.empty:
+            report.warnings.append(f"  Sheet{sheet_label} is empty. Skipping.")
+            continue
 
-                # Cross-check name if possible
-                if student is not None and use_name:
-                    fn_raw = str(row[fn_col]).strip()
-                    ln_raw = str(row[ln_col]).strip()
-                    if fn_raw.lower() != "nan" and ln_raw.lower() != "nan":
-                        expected_fn = normalize_name(student.first_name)
-                        expected_ln = normalize_name(student.last_name)
-                        got_fn = normalize_name(fn_raw)
-                        got_ln = normalize_name(ln_raw)
-                        if (got_fn, got_ln) != (expected_fn, expected_ln):
-                            master_full = f"{student.first_name} {student.last_name}"
-                            ta_full = f"{fn_raw} {ln_raw}"
+        cols = list(df.columns)
 
-                            if sid in confirmed_ids:
-                                report.warnings.append(
-                                    f"  Row {row_idx}: ID '{sid}' name mismatch "
-                                    f"(master='{master_full}', "
-                                    f"TA='{ta_full}') — "
-                                    "previously confirmed, proceeding."
-                                )
-                            elif interactive:
-                                confirmed = prompt_name_mismatch(
-                                    sid, master_full, ta_full, path.name
-                                )
-                                if confirmed:
-                                    report.new_name_confirmations.append(sid)
-                                    report.warnings.append(
-                                        f"  Row {row_idx}: ID '{sid}' name "
-                                        f"mismatch confirmed by user."
-                                    )
-                                else:
-                                    report.warnings.append(
-                                        f"  Row {row_idx}: ID '{sid}' name "
-                                        f"mismatch rejected by user. "
-                                        "Skipping row."
-                                    )
-                                    student = None
-                                    continue
-                            else:
-                                report.warnings.append(
-                                    f"  Row {row_idx}: ID '{sid}' matches "
-                                    f"'{master_full}' in master, "
-                                    f"but TA file says '{ta_full}'. "
-                                    "Proceeding with ID match "
-                                    "(non-interactive)."
-                                )
+        # Detect columns with override + ambiguity support
+        id_col, id_ov = _resolve_column(
+            "id", cols, overrides, path.name, interactive, report
+        )
+        fn_col, fn_ov = _resolve_column(
+            "first_name", cols, overrides, path.name, interactive, report
+        )
+        ln_col, ln_ov = _resolve_column(
+            "last_name", cols, overrides, path.name, interactive, report
+        )
 
-                if student is None and sid:
-                    # ID not in master — try name fallback
-                    if use_name:
-                        fn_raw = str(row[fn_col]).strip()
-                        ln_raw = str(row[ln_col]).strip()
-                        report.warnings.append(
-                            f"  Row {row_idx}: ID '{sid}' not found in master. "
-                            f"Attempting name fallback ({fn_raw} {ln_raw})."
-                        )
-                    else:
-                        report.warnings.append(
-                            f"  Row {row_idx}: ID '{sid}' not found in master "
-                            "and no name columns to fall back on. Skipping row."
-                        )
-                        continue
+        known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
 
-        # Fallback to name matching (or primary if no ID column)
-        if student is None and use_name:
-            fn_raw = str(row[fn_col]).strip()
-            ln_raw = str(row[ln_col]).strip()
-            if fn_raw.lower() == "nan" or ln_raw.lower() == "nan":
+        # Grade column: check override first, then use the advanced detection
+        grade_col: str | None = None
+        grade_ov: dict[str, str] = {}
+
+        if "grade" in overrides:
+            override_grade = overrides["grade"]
+            if override_grade in cols:
                 report.warnings.append(
-                    f"  Row {row_idx}: missing name data. Skipping row."
+                    f"  Using saved override for grade: '{override_grade}'."
                 )
-                continue
-
-            nk = make_name_key(fn_raw, ln_raw)
-            matches = master.by_name.get(nk, [])
-            match_desc = f"name='{fn_raw} {ln_raw}'"
-
-            if len(matches) == 1:
-                student = matches[0]
-            elif len(matches) > 1:
-                report.warnings.append(
-                    f"  Row {row_idx}: name '{fn_raw} {ln_raw}' matches "
-                    f"{len(matches)} students in master. Skipping — "
-                    "manual check required."
-                )
-                continue
+                grade_col = override_grade
             else:
                 report.warnings.append(
-                    f"  Row {row_idx}: {match_desc} not found in master. Skipping row."
+                    f"  Saved override '{override_grade}' for grade not found "
+                    "in columns. Falling back to detection."
+                )
+
+        if grade_col is None:
+            grade_col, gw, ambiguous = detect_grade_column(df, known_cols)
+            report.warnings.extend(gw)
+
+            if grade_col is None and ambiguous and interactive:
+                grade_col = prompt_column_choice(ambiguous, path.name, "grade")
+                if grade_col is not None:
+                    report.warnings.append(
+                        f"  Grade column manually selected: '{grade_col}'."
+                    )
+                    grade_ov["grade"] = grade_col
+
+        if grade_col is None:
+            report.warnings.append(
+                f"  No grade column found{sheet_label}. Skipping sheet."
+            )
+            continue
+
+        all_new_overrides.update({**id_ov, **fn_ov, **ln_ov, **grade_ov})
+
+        # Determine matching strategy
+        use_id = id_col is not None
+        use_name = fn_col is not None and ln_col is not None
+
+        if not use_id and not use_name:
+            report.warnings.append(
+                f"  Sheet{sheet_label} has neither a student ID column nor "
+                "both first/last name columns. Skipping sheet."
+            )
+            continue
+
+        if sheet_name:
+            report.warnings.append(f"  Processing sheet '{sheet_name}'...")
+
+        # Process each row in this sheet
+        for row_idx, row in df.iterrows():
+            raw_grade = row.get(grade_col)
+            parsed = parse_grade(raw_grade)
+
+            student: Student | None = None
+            match_desc = ""
+
+            if use_id:
+                sid = str(row[id_col]).strip()
+                if sid and sid.lower() != "nan":
+                    student = master.by_id.get(sid)
+                    match_desc = f"ID={sid}"
+
+                    # Cross-check name if possible
+                    if student is not None and use_name:
+                        fn_raw = str(row[fn_col]).strip()
+                        ln_raw = str(row[ln_col]).strip()
+                        if fn_raw.lower() != "nan" and ln_raw.lower() != "nan":
+                            expected_fn = normalize_name(student.first_name)
+                            expected_ln = normalize_name(student.last_name)
+                            got_fn = normalize_name(fn_raw)
+                            got_ln = normalize_name(ln_raw)
+                            if (got_fn, got_ln) != (expected_fn, expected_ln):
+                                master_full = (
+                                    f"{student.first_name} {student.last_name}"
+                                )
+                                ta_full = f"{fn_raw} {ln_raw}"
+
+                                if sid in confirmed_ids:
+                                    report.warnings.append(
+                                        f"  Row {row_idx}: ID '{sid}' name mismatch "
+                                        f"(master='{master_full}', "
+                                        f"TA='{ta_full}') — "
+                                        "previously confirmed, proceeding."
+                                    )
+                                elif interactive:
+                                    confirmed = prompt_name_mismatch(
+                                        sid, master_full, ta_full, path.name
+                                    )
+                                    if confirmed:
+                                        report.new_name_confirmations.append(sid)
+                                        report.warnings.append(
+                                            f"  Row {row_idx}: ID '{sid}' name "
+                                            f"mismatch confirmed by user."
+                                        )
+                                    else:
+                                        report.warnings.append(
+                                            f"  Row {row_idx}: ID '{sid}' name "
+                                            f"mismatch rejected by user. "
+                                            "Skipping row."
+                                        )
+                                        student = None
+                                        continue
+                                else:
+                                    report.warnings.append(
+                                        f"  Row {row_idx}: ID '{sid}' matches "
+                                        f"'{master_full}' in master, "
+                                        f"but TA file says '{ta_full}'. "
+                                        "Proceeding with ID match "
+                                        "(non-interactive)."
+                                    )
+
+                    if student is None and sid:
+                        # ID not in master — try name fallback
+                        if use_name:
+                            fn_raw = str(row[fn_col]).strip()
+                            ln_raw = str(row[ln_col]).strip()
+                            report.warnings.append(
+                                f"  Row {row_idx}: ID '{sid}' not found in master. "
+                                f"Attempting name fallback ({fn_raw} {ln_raw})."
+                            )
+                        else:
+                            report.warnings.append(
+                                f"  Row {row_idx}: ID '{sid}' not found in master "
+                                "and no name columns to fall back on. Skipping row."
+                            )
+                            continue
+
+            # Fallback to name matching (or primary if no ID column)
+            if student is None and use_name:
+                fn_raw = str(row[fn_col]).strip()
+                ln_raw = str(row[ln_col]).strip()
+                if fn_raw.lower() == "nan" or ln_raw.lower() == "nan":
+                    report.warnings.append(
+                        f"  Row {row_idx}: missing name data. Skipping row."
+                    )
+                    continue
+
+                nk = make_name_key(fn_raw, ln_raw)
+                matches = master.by_name.get(nk, [])
+                match_desc = f"name='{fn_raw} {ln_raw}'"
+
+                if len(matches) == 1:
+                    student = matches[0]
+                elif len(matches) > 1:
+                    report.warnings.append(
+                        f"  Row {row_idx}: name '{fn_raw} {ln_raw}' matches "
+                        f"{len(matches)} students in master. Skipping — "
+                        "manual check required."
+                    )
+                    continue
+                else:
+                    report.warnings.append(
+                        f"  Row {row_idx}: {match_desc} not found in master. Skipping row."
+                    )
+                    continue
+
+            if student is None:
+                continue
+
+            report.students_matched += 1
+
+            # Check for duplicate grading
+            if student.grade is not None or student.is_absent:
+                prev_src = student.grade_source or "unknown"
+                report.warnings.append(
+                    f"  WARNING: student '{student.first_name} {student.last_name}' "
+                    f"(ID={student.student_id}) already has a grade from '{prev_src}'. "
+                    f"Duplicate found in '{path.name}'. Keeping first grade."
                 )
                 continue
 
-        if student is None:
-            continue
+            # Assign grade
+            if parsed.warning and not parsed.is_absent and parsed.value is None:
+                report.warnings.append(
+                    f"  Row {row_idx}: {match_desc} — {parsed.warning}. No grade assigned."
+                )
+                continue
 
-        report.students_matched += 1
+            if parsed.is_absent:
+                student.is_absent = True
+                student.grade_source = str(path.name)
+                report.students_absent += 1
+            elif parsed.value is not None:
+                student.grade = parsed.value
+                student.grade_source = str(path.name)
+                report.grades_assigned += 1
+            # else: empty cell, leave ungraded
 
-        # Check for duplicate grading
-        if student.grade is not None or student.is_absent:
-            prev_src = student.grade_source or "unknown"
-            report.warnings.append(
-                f"  WARNING: student '{student.first_name} {student.last_name}' "
-                f"(ID={student.student_id}) already has a grade from '{prev_src}'. "
-                f"Duplicate found in '{path.name}'. Keeping first grade."
-            )
-            continue
+    # Collect all new overrides for persistence
+    report.new_overrides = all_new_overrides
 
-        # Assign grade
-        if parsed.warning and not parsed.is_absent and parsed.value is None:
-            report.warnings.append(
-                f"  Row {row_idx}: {match_desc} — {parsed.warning}. No grade assigned."
-            )
-            continue
-
-        if parsed.is_absent:
-            student.is_absent = True
-            student.grade_source = str(path.name)
-            report.students_absent += 1
-        elif parsed.value is not None:
-            student.grade = parsed.value
-            student.grade_source = str(path.name)
-            report.grades_assigned += 1
-        # else: empty cell, leave ungraded
+    # If no sheets yielded any matches, mark as skipped
+    if report.students_matched == 0 and report.grades_assigned == 0:
+        report.skipped = True
 
     return report
 
