@@ -2153,3 +2153,119 @@ class TestNameMismatchConfirmation:
         master, reports = consolidate(cfg_path, interactive=False)
         assert master.by_id["S001"].grade == 16.0
         assert any("previously confirmed" in w.lower() for w in reports[0].warnings)
+
+
+# ============================================================================
+# 20. Name split mismatch (full name identical, parts differ)
+# ============================================================================
+
+
+class TestNameSplitMismatch:
+    def test_different_split_same_full_name_no_prompt(self, tmp_path):
+        """Different first/last split but same full name should NOT prompt."""
+        # Master: first="Mohamed Ayoub", last="Mebarki"
+        df = _master_df([("12345", "Mohamed Ayoub", "Mebarki", "ma@etu.fr")])
+        master, _ = build_master_index(df)
+        p = tmp_path / "ta.csv"
+        # TA: first="Mohamed", last="Ayoub Mebarki" (different split)
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Mohamed", "Ayoub Mebarki", "15"]],
+        )
+        # Should NOT prompt — interactive=True but no monkeypatch needed
+        # because the prompt should never be reached
+        report = process_ta_file(p, master, interactive=True)
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        # No name mismatch warnings
+        assert not any("name mismatch" in w.lower() for w in report.warnings)
+
+    def test_real_mismatch_still_prompts(self, tmp_path, monkeypatch):
+        """Actual name difference (not just split) still triggers prompt."""
+        df = _master_df([("12345", "Jean", "Dupont", "jd@etu.fr")])
+        master, _ = build_master_index(df)
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupond", "15"]],  # Dupond ≠ Dupont
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        report = process_ta_file(p, master, interactive=True)
+        assert report.grades_assigned == 1
+        assert any("mismatch" in w.lower() for w in report.warnings)
+
+
+# ============================================================================
+# 21. Multi-sheet override propagation
+# ============================================================================
+
+
+class TestMultiSheetOverridePropagation:
+    def test_interactive_choice_carries_to_second_sheet(self, tmp_path, monkeypatch):
+        """Grade column chosen interactively on sheet 1 reused on sheet 2."""
+        master = _build_master()
+        p = tmp_path / "ta.xlsx"
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "DC-1"
+        ws1.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
+        ws1.append(["12345", "Jean", "18", "15"])
+
+        ws2 = wb.create_sheet("DC-2")
+        ws2.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
+        ws2.append(["12346", "Marie", "17", "14"])
+        wb.save(p)
+
+        # User should only be prompted ONCE (for sheet 1),
+        # sheet 2 reuses the override
+        call_count = 0
+
+        def mock_input(prompt):
+            nonlocal call_count
+            call_count += 1
+            return "2"  # select "Note /20"
+
+        monkeypatch.setattr("builtins.input", mock_input)
+        report = process_ta_file(p, master, interactive=True)
+
+        assert not report.skipped
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 15.0  # Note /20 value
+        assert master.by_id["12346"].grade == 14.0  # Note /20 value
+        assert call_count == 1  # Only prompted once!
+        assert report.new_overrides.get("grade") == "Note /20"
+
+    def test_saved_override_applies_to_all_sheets(self, tmp_path):
+        """Saved YAML override works for all sheets without prompting."""
+        master = _build_master()
+        p = tmp_path / "ta.xlsx"
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "DC-1"
+        ws1.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
+        ws1.append(["12345", "Jean", "18", "15"])
+
+        ws2 = wb.create_sheet("DC-2")
+        ws2.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
+        ws2.append(["12346", "Marie", "17", "14"])
+        wb.save(p)
+
+        # No monkeypatch — override from YAML should handle both sheets
+        report = process_ta_file(
+            p,
+            master,
+            interactive=True,
+            column_overrides={"grade": "Note /20"},
+        )
+        assert not report.skipped
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 15.0
+        assert master.by_id["12346"].grade == 14.0

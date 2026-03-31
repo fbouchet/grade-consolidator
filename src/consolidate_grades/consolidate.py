@@ -861,6 +861,9 @@ def process_ta_file(
         )
 
     all_new_overrides: dict[str, str] = {}
+    # Working copy of overrides that accumulates interactive choices
+    # so subsequent sheets benefit from earlier selections
+    active_overrides = dict(overrides)
 
     for sheet_name, df in sheets:
         sheet_label = f" [sheet '{sheet_name}']" if sheet_name else ""
@@ -873,13 +876,13 @@ def process_ta_file(
 
         # Detect columns with override + ambiguity support
         id_col, id_ov = _resolve_column(
-            "id", cols, overrides, path.name, interactive, report
+            "id", cols, active_overrides, path.name, interactive, report
         )
         fn_col, fn_ov = _resolve_column(
-            "first_name", cols, overrides, path.name, interactive, report
+            "first_name", cols, active_overrides, path.name, interactive, report
         )
         ln_col, ln_ov = _resolve_column(
-            "last_name", cols, overrides, path.name, interactive, report
+            "last_name", cols, active_overrides, path.name, interactive, report
         )
 
         known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
@@ -888,8 +891,8 @@ def process_ta_file(
         grade_col: str | None = None
         grade_ov: dict[str, str] = {}
 
-        if "grade" in overrides:
-            override_grade = overrides["grade"]
+        if "grade" in active_overrides:
+            override_grade = active_overrides["grade"]
             if override_grade in cols:
                 report.warnings.append(
                     f"  Using saved override for grade: '{override_grade}'."
@@ -919,7 +922,9 @@ def process_ta_file(
             )
             continue
 
-        all_new_overrides.update({**id_ov, **fn_ov, **ln_ov, **grade_ov})
+        sheet_overrides = {**id_ov, **fn_ov, **ln_ov, **grade_ov}
+        all_new_overrides.update(sheet_overrides)
+        active_overrides.update(sheet_overrides)
 
         # Determine matching strategy
         use_id = id_col is not None
@@ -958,7 +963,13 @@ def process_ta_file(
                             expected_ln = normalize_name(student.last_name)
                             got_fn = normalize_name(fn_raw)
                             got_ln = normalize_name(ln_raw)
-                            if (got_fn, got_ln) != (expected_fn, expected_ln):
+                            # Compare full concatenated names first — handles
+                            # cases where first/last split differs between
+                            # master and TA (e.g. "Mohamed Ayoub" / "Mebarki"
+                            # vs "Mohamed" / "Ayoub Mebarki")
+                            master_full_norm = f"{expected_fn} {expected_ln}"
+                            ta_full_norm = f"{got_fn} {got_ln}"
+                            if master_full_norm != ta_full_norm:
                                 master_full = (
                                     f"{student.first_name} {student.last_name}"
                                 )
