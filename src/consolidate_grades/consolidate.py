@@ -717,7 +717,7 @@ class FileReport:
     grades_assigned: int = 0
     warnings: list[str] = field(default_factory=list)
     skipped: bool = False
-    new_overrides: dict[str, str] = field(default_factory=dict)
+    new_file_overrides: dict | None = None
     new_name_confirmations: list[str] = field(default_factory=list)
 
 
@@ -760,6 +760,46 @@ def prompt_column_choice(
             return None
         else:
             print(f"  Please enter a number between 1 and {len(candidates) + 1}.")
+
+
+def prompt_sheet_selection(sheet_names: list[str], filename: str) -> list[str]:
+    """
+    Interactively ask the user which sheets to process.
+
+    Returns the list of selected sheet names (may be empty to skip all).
+    """
+    print(f"\n  Multiple sheets found in '{filename}':")
+    for i, name in enumerate(sheet_names, 1):
+        print(f"    {i}. {name}")
+    print("  Enter sheet numbers to process (comma-separated), or 'all', or 'none':")
+
+    while True:
+        try:
+            raw = input("  Sheets: ").strip().lower()
+        except EOFError:
+            print("  Please enter a valid selection.")
+            continue
+
+        if raw == "all":
+            selected = list(sheet_names)
+            print(f"  -> Using all {len(selected)} sheets.")
+            return selected
+        if raw in ("none", "skip", "0"):
+            print("  -> Skipping all sheets.")
+            return []
+
+        try:
+            indices = [int(x.strip()) for x in raw.split(",")]
+        except ValueError:
+            print("  Please enter numbers separated by commas, 'all', or 'none'.")
+            continue
+
+        if all(1 <= idx <= len(sheet_names) for idx in indices):
+            selected = [sheet_names[idx - 1] for idx in indices]
+            print(f"  -> Using sheets: {selected}")
+            return selected
+
+        print(f"  Numbers must be between 1 and {len(sheet_names)}.")
 
 
 def _resolve_column(
@@ -823,47 +863,79 @@ def process_ta_file(
     master: MasterIndex,
     *,
     interactive: bool = True,
-    column_overrides: dict[str, str] | None = None,
+    file_overrides: dict | None = None,
     name_confirmations: list[str] | None = None,
 ) -> FileReport:
     """Process one TA grade file and update the master index in place.
 
-    ``column_overrides`` is an optional dict of role -> column name that were
-    previously saved from interactive choices.  New interactive choices are
-    stored in ``report.new_overrides`` for the caller to persist.
+    ``file_overrides`` is the per-file override dict from YAML, which may
+    contain flat column overrides (single-sheet) or structured multi-sheet
+    overrides with ``selected_sheets`` and ``sheet_columns`` keys.
 
     ``name_confirmations`` is an optional list of student IDs for which a
-    name mismatch was previously confirmed.  New confirmations are stored
-    in ``report.new_name_confirmations``.
+    name mismatch was previously confirmed.
     """
     path = Path(path)
     report = FileReport(filename=str(path))
-    overrides = column_overrides or {}
+    overrides = file_overrides or {}
     confirmed_ids = set(name_confirmations or [])
 
     # Read all sheets (CSV returns one sheet with name "")
     try:
-        sheets = read_file_sheets(path)
+        all_sheets = read_file_sheets(path)
     except Exception as e:
         report.warnings.append(f"  Could not read file: {e}")
         report.skipped = True
         return report
 
-    if not sheets:
+    if not all_sheets:
         report.warnings.append("  No valid sheets found in file.")
         report.skipped = True
         return report
 
-    if len(sheets) > 1:
-        sheet_names = [name for name, _ in sheets]
-        report.warnings.append(
-            f"  Found {len(sheets)} sheets with grade data: {sheet_names}."
-        )
+    # --- Sheet selection for multi-sheet files ---
+    is_multi = len(all_sheets) > 1
+    selected_sheets_changed = False
 
-    all_new_overrides: dict[str, str] = {}
-    # Working copy of overrides that accumulates interactive choices
-    # so subsequent sheets benefit from earlier selections
-    active_overrides = dict(overrides)
+    if is_multi:
+        all_sheet_names = [name for name, _ in all_sheets]
+        saved_selection = overrides.get("selected_sheets")
+
+        if saved_selection is not None:
+            # Use saved selection
+            selected_names = [n for n in saved_selection if n in all_sheet_names]
+            report.warnings.append(
+                f"  Using saved sheet selection: {selected_names} "
+                f"(from {len(all_sheet_names)} available)."
+            )
+        elif interactive:
+            selected_names = prompt_sheet_selection(all_sheet_names, path.name)
+            selected_sheets_changed = True
+        else:
+            # Non-interactive: use all sheets with grade-like data
+            selected_names = all_sheet_names
+            report.warnings.append(
+                f"  Found {len(all_sheet_names)} sheets, "
+                "processing all (non-interactive)."
+            )
+
+        if not selected_names:
+            report.warnings.append("  No sheets selected. Skipping file.")
+            report.skipped = True
+            if selected_sheets_changed:
+                report.new_file_overrides = {"selected_sheets": []}
+            return report
+
+        sheets = [(n, df) for n, df in all_sheets if n in selected_names]
+    else:
+        sheets = all_sheets
+
+    # --- Per-sheet column overrides ---
+    saved_sheet_columns: dict[str, dict[str, str]] = overrides.get("sheet_columns", {})
+    new_sheet_columns: dict[str, dict[str, str]] = {}
+    # Shared overrides accumulate interactive choices across sheets,
+    # so a grade column chosen for DC-1 is reused for DC-2
+    shared_overrides: dict[str, str] = {}
 
     for sheet_name, df in sheets:
         sheet_label = f" [sheet '{sheet_name}']" if sheet_name else ""
@@ -874,34 +946,47 @@ def process_ta_file(
 
         cols = list(df.columns)
 
+        # For multi-sheet: per-sheet overrides, falling back to shared
+        # For single-sheet: flat overrides (backward compatible)
+        if is_multi:
+            per_sheet = saved_sheet_columns.get(sheet_name, {})
+            # Merge: per-sheet overrides take priority over shared
+            sheet_col_overrides = {**shared_overrides, **per_sheet}
+        else:
+            sheet_col_overrides = dict(overrides)
+            # Remove non-column keys
+            sheet_col_overrides.pop("selected_sheets", None)
+            sheet_col_overrides.pop("sheet_columns", None)
+
         # Detect columns with override + ambiguity support
         id_col, id_ov = _resolve_column(
-            "id", cols, active_overrides, path.name, interactive, report
+            "id", cols, sheet_col_overrides, path.name, interactive, report
         )
         fn_col, fn_ov = _resolve_column(
-            "first_name", cols, active_overrides, path.name, interactive, report
+            "first_name", cols, sheet_col_overrides, path.name, interactive, report
         )
         ln_col, ln_ov = _resolve_column(
-            "last_name", cols, active_overrides, path.name, interactive, report
+            "last_name", cols, sheet_col_overrides, path.name, interactive, report
         )
 
         known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
 
-        # Grade column: check override first, then use the advanced detection
+        # Grade column: check override first, then use advanced detection
         grade_col: str | None = None
         grade_ov: dict[str, str] = {}
 
-        if "grade" in active_overrides:
-            override_grade = active_overrides["grade"]
+        if "grade" in sheet_col_overrides:
+            override_grade = sheet_col_overrides["grade"]
             if override_grade in cols:
                 report.warnings.append(
-                    f"  Using saved override for grade: '{override_grade}'."
+                    f"  Using saved override for grade: "
+                    f"'{override_grade}'{sheet_label}."
                 )
                 grade_col = override_grade
             else:
                 report.warnings.append(
                     f"  Saved override '{override_grade}' for grade not found "
-                    "in columns. Falling back to detection."
+                    f"in columns{sheet_label}. Falling back to detection."
                 )
 
         if grade_col is None:
@@ -922,9 +1007,14 @@ def process_ta_file(
             )
             continue
 
-        sheet_overrides = {**id_ov, **fn_ov, **ln_ov, **grade_ov}
-        all_new_overrides.update(sheet_overrides)
-        active_overrides.update(sheet_overrides)
+        # Collect per-sheet overrides
+        this_sheet_ov = {**id_ov, **fn_ov, **ln_ov, **grade_ov}
+        if this_sheet_ov:
+            existing = new_sheet_columns.get(sheet_name, {})
+            existing.update(this_sheet_ov)
+            new_sheet_columns[sheet_name] = existing
+            # Feed into shared_overrides so next sheets can reuse
+            shared_overrides.update(this_sheet_ov)
 
         # Determine matching strategy
         use_id = id_col is not None
@@ -1086,8 +1176,20 @@ def process_ta_file(
                 report.grades_assigned += 1
             # else: empty cell, leave ungraded
 
-    # Collect all new overrides for persistence
-    report.new_overrides = all_new_overrides
+    # Build new file overrides for persistence
+    new_ov: dict = {}
+    if is_multi:
+        if selected_sheets_changed:
+            new_ov["selected_sheets"] = [n for n, _ in sheets]
+        if new_sheet_columns:
+            new_ov["sheet_columns"] = new_sheet_columns
+    else:
+        # Single-sheet: flat structure (backward compatible)
+        for _sheet_name, ov in new_sheet_columns.items():
+            new_ov.update(ov)
+
+    if new_ov:
+        report.new_file_overrides = new_ov
 
     # If no sheets yielded any matches, mark as skipped
     if report.students_matched == 0 and report.grades_assigned == 0:
@@ -1302,8 +1404,8 @@ def consolidate(
     if not grade_file_paths:
         print("WARNING: No grade files found. Output will have no grades.")
 
-    # Load existing column overrides and name confirmations
-    all_overrides: dict[str, dict[str, str]] = cfg.get("column_overrides", {})
+    # Load existing file overrides and name confirmations
+    all_overrides: dict[str, dict] = cfg.get("column_overrides", {})
     all_name_confirmations: dict[str, list[str]] = cfg.get("name_confirmations", {})
     config_changed = False
 
@@ -1311,21 +1413,29 @@ def consolidate(
     reports: list[FileReport] = []
     for gf_path in grade_file_paths:
         print(f"Processing: {gf_path}")
-        file_overrides = all_overrides.get(gf_path.name, {})
+        file_ov = all_overrides.get(gf_path.name, {})
         file_name_confs = all_name_confirmations.get(gf_path.name, [])
         report = process_ta_file(
             gf_path,
             master,
             interactive=interactive,
-            column_overrides=file_overrides,
+            file_overrides=file_ov,
             name_confirmations=file_name_confs,
         )
         reports.append(report)
 
-        # Collect new column overrides from interactive choices
-        if report.new_overrides:
+        # Collect new file overrides from interactive choices
+        if report.new_file_overrides:
             existing = all_overrides.get(gf_path.name, {})
-            existing.update(report.new_overrides)
+            # Deep merge: selected_sheets replaces, sheet_columns merges
+            for key, val in report.new_file_overrides.items():
+                if key == "sheet_columns" and "sheet_columns" in existing:
+                    for sn, sv in val.items():
+                        existing_sc = existing["sheet_columns"].get(sn, {})
+                        existing_sc.update(sv)
+                        existing["sheet_columns"][sn] = existing_sc
+                else:
+                    existing[key] = val
             all_overrides[gf_path.name] = existing
             config_changed = True
 

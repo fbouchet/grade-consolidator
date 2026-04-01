@@ -33,6 +33,7 @@ from consolidate_grades.consolidate import (
     promote_header_row,
     prompt_column_choice,
     prompt_name_mismatch,
+    prompt_sheet_selection,
     read_file,
     read_file_sheets,
     resolve_grade_files,
@@ -1778,8 +1779,8 @@ class TestAmbiguousIdColumn:
         assert not report.skipped
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
-        assert "id" in report.new_overrides
-        assert report.new_overrides["id"] == "Numero etudiant"
+        assert "id" in report.new_file_overrides
+        assert report.new_file_overrides["id"] == "Numero etudiant"
 
     def test_ambiguous_id_non_interactive_uses_first(self, tmp_path):
         """Non-interactive mode uses the first match."""
@@ -1833,7 +1834,7 @@ class TestColumnOverrides:
             p,
             master,
             interactive=False,
-            column_overrides={"id": "Numero etudiant"},
+            file_overrides={"id": "Numero etudiant"},
         )
         assert not report.skipped
         assert report.grades_assigned == 1
@@ -1853,7 +1854,7 @@ class TestColumnOverrides:
             p,
             master,
             interactive=False,
-            column_overrides={"grade": "Note /20"},
+            file_overrides={"grade": "Note /20"},
         )
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
@@ -1871,7 +1872,7 @@ class TestColumnOverrides:
             p,
             master,
             interactive=False,
-            column_overrides={"grade": "Nonexistent Column"},
+            file_overrides={"grade": "Nonexistent Column"},
         )
         # Should fall back to detecting "Note"
         assert not report.skipped
@@ -2198,13 +2199,149 @@ class TestNameSplitMismatch:
 
 
 # ============================================================================
-# 21. Multi-sheet override propagation
+# 21. Sheet selection
+# ============================================================================
+
+
+class TestSheetSelection:
+    def test_prompt_all(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "all")
+        result = prompt_sheet_selection(["DC-1", "DC-2", "DC-3"], "file.xlsx")
+        assert result == ["DC-1", "DC-2", "DC-3"]
+
+    def test_prompt_none(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "none")
+        result = prompt_sheet_selection(["DC-1", "DC-2"], "file.xlsx")
+        assert result == []
+
+    def test_prompt_specific(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "1,3")
+        result = prompt_sheet_selection(["DC-1", "DC-2", "DC-3"], "file.xlsx")
+        assert result == ["DC-1", "DC-3"]
+
+    def test_prompt_single(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "2")
+        result = prompt_sheet_selection(["DC-1", "DC-2"], "file.xlsx")
+        assert result == ["DC-2"]
+
+    def test_prompt_invalid_then_valid(self, monkeypatch):
+        inputs = iter(["abc", "99", "1,2"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        result = prompt_sheet_selection(["DC-1", "DC-2"], "file.xlsx")
+        assert result == ["DC-1", "DC-2"]
+
+    def test_saved_selection_reused(self, tmp_path):
+        """Saved sheet selection skips the prompt."""
+        master = _build_master()
+        p = tmp_path / "ta.xlsx"
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "Current Exam"
+        ws1.append(["Numéro étudiant", "Prénom", "Note"])
+        ws1.append(["12345", "Jean", "15"])
+
+        ws2 = wb.create_sheet("Future Exam")
+        ws2.append(["Numéro étudiant", "Prénom", "Note"])
+        ws2.append(["12345", "Jean", ""])  # placeholder row
+
+        ws3 = wb.create_sheet("Other Future")
+        ws3.append(["Numéro étudiant", "Prénom", "Note"])
+        ws3.append(["12345", "Jean", ""])
+        wb.save(p)
+
+        # No monkeypatch — saved selection should work
+        report = process_ta_file(
+            p,
+            master,
+            interactive=True,
+            file_overrides={"selected_sheets": ["Current Exam"]},
+        )
+        assert not report.skipped
+        assert report.grades_assigned == 1
+        assert any("saved sheet selection" in w.lower() for w in report.warnings)
+
+    def test_interactive_selection_persisted_to_yaml(self, tmp_path, monkeypatch):
+        """Interactive sheet selection saved to config YAML."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [["S001", "Alice", "Martin", "alice@univ.fr"]],
+        )
+
+        ta_path = tmp_path / "ta.xlsx"
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "Current"
+        ws1.append(["Numéro étudiant", "Prénom", "Note"])
+        ws1.append(["S001", "Alice", "16"])
+
+        ws2 = wb.create_sheet("Future")
+        ws2.append(["Numéro étudiant", "Prénom", "Note"])
+        ws2.append(["S001", "Alice", ""])  # placeholder
+        wb.save(ta_path)
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["ta.xlsx"],
+                    "output_file": "out.csv",
+                }
+            )
+        )
+
+        # User selects only "Current" (option 1)
+        monkeypatch.setattr("builtins.input", lambda _: "1")
+        consolidate(cfg_path, interactive=True)
+
+        # Re-read config
+        with open(cfg_path, encoding="utf-8") as f:
+            saved_cfg = yaml.safe_load(f)
+        assert "column_overrides" in saved_cfg
+        assert "ta.xlsx" in saved_cfg["column_overrides"]
+        assert saved_cfg["column_overrides"]["ta.xlsx"]["selected_sheets"] == [
+            "Current"
+        ]
+
+    def test_skip_none_sheets(self, tmp_path, monkeypatch):
+        """Selecting 'none' skips the file entirely."""
+        master = _build_master()
+        p = tmp_path / "ta.xlsx"
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "Sheet1"
+        ws1.append(["Numéro étudiant", "Prénom", "Note"])
+        ws1.append(["12345", "Jean", "15"])
+
+        ws2 = wb.create_sheet("Sheet2")
+        ws2.append(["Numéro étudiant", "Prénom", "Note"])
+        ws2.append(["12346", "Marie", "14"])
+        wb.save(p)
+
+        monkeypatch.setattr("builtins.input", lambda _: "none")
+        report = process_ta_file(p, master, interactive=True)
+        assert report.skipped
+        assert master.by_id["12345"].grade is None
+
+
+# ============================================================================
+# 22. Multi-sheet override propagation
 # ============================================================================
 
 
 class TestMultiSheetOverridePropagation:
     def test_interactive_choice_carries_to_second_sheet(self, tmp_path, monkeypatch):
-        """Grade column chosen interactively on sheet 1 reused on sheet 2."""
+        """Sheet selection + grade column chosen on sheet 1 reused on sheet 2."""
         master = _build_master()
         p = tmp_path / "ta.xlsx"
 
@@ -2221,14 +2358,13 @@ class TestMultiSheetOverridePropagation:
         ws2.append(["12346", "Marie", "17", "14"])
         wb.save(p)
 
-        # User should only be prompted ONCE (for sheet 1),
-        # sheet 2 reuses the override
-        call_count = 0
+        # First prompt: sheet selection → "all"
+        # Second prompt: grade column for DC-1 → "2" (Note /20)
+        # DC-2 should reuse the grade choice — no third prompt
+        responses = iter(["all", "2"])
 
         def mock_input(prompt):
-            nonlocal call_count
-            call_count += 1
-            return "2"  # select "Note /20"
+            return next(responses)
 
         monkeypatch.setattr("builtins.input", mock_input)
         report = process_ta_file(p, master, interactive=True)
@@ -2237,8 +2373,10 @@ class TestMultiSheetOverridePropagation:
         assert report.grades_assigned == 2
         assert master.by_id["12345"].grade == 15.0  # Note /20 value
         assert master.by_id["12346"].grade == 14.0  # Note /20 value
-        assert call_count == 1  # Only prompted once!
-        assert report.new_overrides.get("grade") == "Note /20"
+        # Check structure of saved overrides
+        assert "selected_sheets" in report.new_file_overrides
+        assert "sheet_columns" in report.new_file_overrides
+        assert "DC-1" in report.new_file_overrides["sheet_columns"]
 
     def test_saved_override_applies_to_all_sheets(self, tmp_path):
         """Saved YAML override works for all sheets without prompting."""
@@ -2258,12 +2396,18 @@ class TestMultiSheetOverridePropagation:
         ws2.append(["12346", "Marie", "17", "14"])
         wb.save(p)
 
-        # No monkeypatch — override from YAML should handle both sheets
+        # No monkeypatch — saved overrides should handle everything
         report = process_ta_file(
             p,
             master,
             interactive=True,
-            column_overrides={"grade": "Note /20"},
+            file_overrides={
+                "selected_sheets": ["DC-1", "DC-2"],
+                "sheet_columns": {
+                    "DC-1": {"grade": "Note /20"},
+                    "DC-2": {"grade": "Note /20"},
+                },
+            },
         )
         assert not report.skipped
         assert report.grades_assigned == 2
