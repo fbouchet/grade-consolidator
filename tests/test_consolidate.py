@@ -509,6 +509,114 @@ class TestParseGrade:
     def test_absence_full_word(self):
         assert parse_grade("Absence").is_absent
 
+    def test_absent_empty_in_output(self, tmp_path):
+        """Absent students should produce empty cells, not 'ABS'."""
+        master = _build_master()
+        master.by_id["12345"].is_absent = True
+        out = tmp_path / "out.csv"
+        write_moodle_csv(master, out)
+        df = pd.read_csv(out, dtype=str, keep_default_na=False)
+        assert df.loc[df["Numéro d'identification"] == "12345", "Grade"].values[0] == ""
+
+    def test_clamp_above_saved(self, tmp_path):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "21"]],
+        )
+        process_ta_file(
+            p,
+            master,
+            interactive=False,
+            file_overrides={"clamp_above": True},
+            max_grade=20,
+        )
+        assert master.by_id["12345"].grade == 20
+
+    def test_clamp_above_interactive(self, tmp_path, monkeypatch):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "21"]],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        report = process_ta_file(p, master, interactive=True, max_grade=20)
+        assert master.by_id["12345"].grade == 20
+        assert report.new_file_overrides == {"clamp_above": True}
+
+    def test_clamp_below_reject(self, tmp_path, monkeypatch):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "-3"]],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        process_ta_file(p, master, interactive=True, min_grade=0)
+        assert master.by_id["12345"].grade == -3
+
+    def test_unknown_token_prompt_yes(self, tmp_path, monkeypatch):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "—"]],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        report = process_ta_file(p, master, interactive=True)
+        assert master.by_id["12345"].is_absent
+        assert "—" in report.new_absent_tokens
+
+    def test_unknown_token_prompt_no(self, tmp_path, monkeypatch):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "X"]],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        report = process_ta_file(p, master, interactive=True)
+        assert master.by_id["12345"].grade is None
+        assert not master.by_id["12345"].is_absent
+        assert report.new_absent_tokens == []
+
+    def test_extra_absent_tokens_via_yaml(self, tmp_path):
+        """YAML absent_tokens list extends the built-in set."""
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [["S1", "Alice", "Martin", "a@e.fr"]],
+        )
+        ta_path = tmp_path / "ta.csv"
+        _write_csv(
+            ta_path,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["S1", "Alice", "Martin", "-"]],
+        )
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["ta.csv"],
+                    "output_file": "out.csv",
+                    "exam_name": "Test",
+                    "id_column_name": "ID",
+                    "absent_tokens": ["-", "NR"],
+                }
+            )
+        )
+        master, _ = consolidate(cfg_path, interactive=False)
+        assert master.by_id["S1"].is_absent
+
     def test_absent_lowercase(self):
         assert parse_grade("abs").is_absent
 
@@ -688,7 +796,7 @@ class TestWriteMoodleCsv:
         assert jean["Grade"] == "15.5"
 
         marie = df[df["Numéro d'identification"] == "12346"].iloc[0]
-        assert marie["Grade"] == "ABS"
+        assert marie["Grade"] == ""
 
     def test_no_grade_is_empty(self, tmp_path):
         master = _build_master()
@@ -1158,6 +1266,5 @@ class TestIntegration:
         assert "Partiel" in df.columns
         assert "Numéro d'identification" in df.columns
         assert (
-            df.loc[df["Numéro d'identification"] == "S002", "Partiel"].values[0]
-            == "ABS"
+            df.loc[df["Numéro d'identification"] == "S002", "Partiel"].values[0] == ""
         )

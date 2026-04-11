@@ -1,21 +1,58 @@
-# consolidate_grades configuration
-# ---------------------------------
-# Paths are relative to this config file's directory.
+# ============================================================
+# consolidate-grades — example config
+# ============================================================
 
-master_file: "master.csv"
+# ----- Required -----
+master_file: students_master.csv
+grade_files:
+  - notes_groupe_A.csv
+  - notes_groupe_B.xlsx
+# OR scan a directory:
+# grade_dir: ta_grades/
+output_file: moodle_import.csv
 
-# Option 1: List grade files explicitly
-# grade_files:
-#   - "group1_grades.csv"
-#   - "group2_grades.xlsx"
-#   - "group3_grades.ods"
+# ----- Output column headers -----
+# Prompted on first run, saved here. Become the column names in
+# the output CSV imported into Moodle.
+exam_name: "Partiel Mars 2026"
+id_column_name: "Numéro d'identification"
 
-# Option 2: Point to a directory - all .csv, .xlsx, .ods, .tsv files are picked up
-grade_dir: "ta_grades/"
+# ----- Grade bounds (optional) -----
+# When a parsed grade falls outside [min, max], the script prompts
+# you to confirm clamping. Confirmation is saved per file under
+# column_overrides.<filename>.clamp_above / clamp_below.
+min_grade: 0
+max_grade: 20
 
-# Option 3: Both - files from grade_files + everything in grade_dir (deduplicated)
-# grade_files:
-#   - "late_submission.csv"
-# grade_dir: "ta_grades/"
+# ----- Extra "absent" tokens -----
+# Extends the built-in set (ABS, ABSENCE, DEF, DÉFAILLANT, ...).
+# Auto-populated when you confirm an unknown value means absent.
+absent_tokens:
+  - "-"
+  - "NR"
+  - "non rendu"
 
-output_file: "grades_consolidated.csv"
+# ============================================================
+# Auto-generated below — edit by hand only if you know what
+# you're doing. The script populates these as you make
+# interactive choices on first run.
+# ============================================================
+
+# Per-file column overrides
+column_overrides:
+  notes_groupe_A.csv:
+    grade: "Note /20"
+    clamp_above: true        # silently clamp grades > max_grade
+
+  notes_groupe_B.xlsx:
+    selected_sheets: ["DC-1", "DC-2"]
+    sheet_columns:
+      DC-1:
+        grade: "Note /20"
+      DC-2:
+        grade: "Note /20"
+
+# ID-based name mismatches you've already confirmed
+name_confirmations:
+  notes_groupe_A.csv:
+    - "21441829"

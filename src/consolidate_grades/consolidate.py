@@ -267,7 +267,7 @@ def _looks_numeric_grade(series: pd.Series) -> bool:
         s = str(v).strip().replace(",", ".")
         if s == "" or s.lower() == "nan":
             continue
-        if s.upper() in ABSENT_TOKENS:
+        if _is_absent_token(s):
             valid += 1
             continue
         try:
@@ -448,6 +448,14 @@ ABSENT_TOKENS = {
     "DÉFAILLANT",
 }
 
+# Extended at runtime by consolidate() from YAML config (absent_tokens key)
+_EXTRA_ABSENT_TOKENS: set[str] = set()
+
+
+def _is_absent_token(value: str) -> bool:
+    upper = value.upper().strip()
+    return upper in ABSENT_TOKENS or upper in _EXTRA_ABSENT_TOKENS
+
 
 @dataclass
 class ParsedGrade:
@@ -463,13 +471,69 @@ def parse_grade(raw) -> ParsedGrade:
     s = str(raw).strip()
     if s == "" or s.lower() == "nan":
         return ParsedGrade(warning="empty cell")
-    if s.upper() in ABSENT_TOKENS:
+    if _is_absent_token(s):
         return ParsedGrade(is_absent=True)
     s = s.replace(",", ".")
     try:
         return ParsedGrade(value=float(s))
     except ValueError:
         return ParsedGrade(warning=f"could not parse grade value '{raw}'")
+
+
+def clamp_grade_value(
+    value: float, min_grade: float | None, max_grade: float | None
+) -> tuple[float, str | None]:
+    """Clamp value to [min, max]. Returns (clamped, 'above'|'below'|None)."""
+    if max_grade is not None and value > max_grade:
+        return max_grade, "above"
+    if min_grade is not None and value < min_grade:
+        return min_grade, "below"
+    return value, None
+
+
+def prompt_clamp_grade(
+    value: float, bound: float, direction: str, sid: str, filename: str
+) -> bool:
+    """Ask the user to confirm clamping. Returns True if accepted."""
+    rel = "above max" if direction == "above" else "below min"
+    msg = f"Grade {value:g} for student {sid} is {rel} ({bound:g}) in {filename!r}."
+    print(f"\n  {C.warn(msg)}")
+    while True:
+        try:
+            raw = input(f"  Clamp to {bound:g}? [y/n]: ").strip().lower()
+        except EOFError:
+            print("  Please enter y or n.")
+            continue
+        if raw in ("y", "yes"):
+            print(f"  -> {C.ok(f'Clamped to {bound:g}.')}")
+            return True
+        if raw in ("n", "no"):
+            print(f"  -> {C.warn('Keeping original value.')}")
+            return False
+        print("  Please enter y or n.")
+
+
+def prompt_absent_token(token: str, sid: str, filename: str) -> bool:
+    """Ask if an unknown non-numeric value means 'absent'."""
+    msg = f"Unknown grade value {token!r} for student {sid} in {filename!r}."
+    print(f"\n  {C.warn(msg)}")
+    while True:
+        try:
+            raw = (
+                input(f"  Does {token!r} mean the student was absent? [y/n]: ")
+                .strip()
+                .lower()
+            )
+        except EOFError:
+            print("  Please enter y or n.")
+            continue
+        if raw in ("y", "yes"):
+            print(f"  -> {C.ok(f'Saved {token!r} as an absent token.')}")
+            return True
+        if raw in ("n", "no"):
+            print(f"  -> {C.warn('Ignoring this value.')}")
+            return False
+        print("  Please enter y or n.")
 
 
 # ============================================================================
@@ -712,6 +776,7 @@ class FileReport:
     skipped: bool = False
     new_file_overrides: dict | None = None
     new_name_confirmations: list[str] = field(default_factory=list)
+    new_absent_tokens: list[str] = field(default_factory=list)
 
 
 _ROLE_LABELS = {
@@ -849,6 +914,8 @@ def process_ta_file(
     interactive: bool = True,
     file_overrides: dict | None = None,
     name_confirmations: list[str] | None = None,
+    min_grade: float | None = None,
+    max_grade: float | None = None,
 ) -> FileReport:
     """Process one TA grade file and update the master index in place.
 
@@ -1186,6 +1253,19 @@ def process_ta_file(
                 continue
 
             if parsed.warning and not parsed.is_absent and parsed.value is None:
+                raw_str = str(raw_grade).strip()
+                if (
+                    interactive
+                    and raw_str
+                    and raw_str.lower() != "nan"
+                    and raw_str.upper() not in _EXTRA_ABSENT_TOKENS
+                ) and prompt_absent_token(raw_str, student.student_id, path.name):
+                    _EXTRA_ABSENT_TOKENS.add(raw_str.upper())
+                    report.new_absent_tokens.append(raw_str)
+                    student.is_absent = True
+                    student.grade_source = str(path.name)
+                    report.students_absent += 1
+                    continue
                 report.warnings.append(
                     f"  Row {row_idx}: {match_desc} — {parsed.warning}. No grade assigned."
                 )
@@ -1196,6 +1276,44 @@ def process_ta_file(
                 student.grade_source = str(path.name)
                 report.students_absent += 1
             elif parsed.value is not None:
+                clamped, direction = clamp_grade_value(
+                    parsed.value, min_grade, max_grade
+                )
+                if direction is not None:
+                    flag_key = "clamp_above" if direction == "above" else "clamp_below"
+                    bound = max_grade if direction == "above" else min_grade
+                    if sheet_col_overrides.get(flag_key):
+                        report.warnings.append(
+                            f"  Row {row_idx}: grade {parsed.value:g} "
+                            f"clamped to {clamped:g} (saved override)."
+                        )
+                        parsed.value = clamped
+                    elif interactive:
+                        if prompt_clamp_grade(
+                            parsed.value,
+                            bound,
+                            direction,
+                            student.student_id,
+                            path.name,
+                        ):
+                            parsed.value = clamped
+                            this_sheet_ov[flag_key] = True
+                            existing = new_sheet_columns.get(sheet_name, {})
+                            existing[flag_key] = True
+                            new_sheet_columns[sheet_name] = existing
+                            report.warnings.append(
+                                f"  Row {row_idx}: clamped {direction}-bound to {clamped:g}."
+                            )
+                        else:
+                            report.warnings.append(
+                                f"  Row {row_idx}: out-of-range grade "
+                                f"{parsed.value:g} kept as-is."
+                            )
+                    else:
+                        report.warnings.append(
+                            f"  Row {row_idx}: out-of-range grade "
+                            f"{parsed.value:g} (non-interactive, kept)."
+                        )
                 student.grade = parsed.value
                 student.grade_source = str(path.name)
                 report.grades_assigned += 1
@@ -1240,9 +1358,9 @@ def write_moodle_csv(
     rows = []
     for s in master.all_students:
         grade_str = ""
-        if s.is_absent:
-            grade_str = "ABS"
-        elif s.grade is not None:
+        # Absent students intentionally get an EMPTY cell (not "ABS", not 0).
+        # Moodle import treats empty as no grade.
+        if s.grade is not None and not s.is_absent:
             grade_str = f"{s.grade:g}"
         rows.append(
             {
@@ -1426,6 +1544,13 @@ def consolidate(
     cfg = load_config(config_path)
     config_changed = False
 
+    # Load any user-defined absent tokens from the YAML config (extends
+    # the built-in ABSENT_TOKENS set globally for this run).
+    extra_tokens = cfg.get("absent_tokens", [])
+    if isinstance(extra_tokens, list):
+        _EXTRA_ABSENT_TOKENS.clear()
+        _EXTRA_ABSENT_TOKENS.update(str(t).upper().strip() for t in extra_tokens)
+
     config_dir = Path(config_path).parent
 
     master_path = Path(cfg["master_file"])
@@ -1526,6 +1651,8 @@ def consolidate(
             interactive=interactive,
             file_overrides=file_ov,
             name_confirmations=file_name_confs,
+            min_grade=cfg.get("min_grade"),
+            max_grade=cfg.get("max_grade"),
         )
         reports.append(report)
 
@@ -1547,6 +1674,20 @@ def consolidate(
             existing_confs.extend(report.new_name_confirmations)
             all_name_confirmations[gf_path.name] = existing_confs
             config_changed = True
+
+    # Collect newly-discovered absent tokens
+    new_tokens: list[str] = []
+    for r in reports:
+        for t in r.new_absent_tokens:
+            if t not in new_tokens:
+                new_tokens.append(t)
+    if new_tokens:
+        existing_tokens = list(cfg.get("absent_tokens", []))
+        for t in new_tokens:
+            if t not in existing_tokens:
+                existing_tokens.append(t)
+        cfg["absent_tokens"] = existing_tokens
+        config_changed = True
 
     if config_changed:
         if all_overrides:
