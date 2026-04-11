@@ -1428,6 +1428,22 @@ def consolidate(
         print(f"  {C.info('ID column name')} : {C.bold(id_column_name)}")
     else:
         if interactive:
+            # Explanatory preamble: these are global output settings, not
+            # tied to any specific TA file. Without this header, it's
+            # confusing why the script is asking for an exam name out of
+            # the blue.
+            print()
+            print(C.bold("=" * 60))
+            print(C.bold("First-time setup for this config file"))
+            print(C.bold("=" * 60))
+            print(
+                C.dim(
+                    "  These two values become the column headers in the\n"
+                    "  output CSV (the file you import into Moodle). They\n"
+                    "  will be saved to your YAML config so you won't be\n"
+                    "  asked again on subsequent runs.\n"
+                )
+            )
             if not exam_name:
                 try:
                     exam_name = input(
@@ -1457,6 +1473,7 @@ def consolidate(
                     print(C.dim(f"  -> Using default: '{id_column_name}'"))
                 cfg["id_column_name"] = id_column_name
                 config_changed = True
+            print(C.bold("=" * 60))
         else:
             exam_name = exam_name or "Grade"
             id_column_name = id_column_name or "Numéro d'identification"
