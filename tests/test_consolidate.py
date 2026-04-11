@@ -113,10 +113,7 @@ class TestNormalizeText:
         assert normalize_text("Nº étudiant") == "no etudiant"
 
     def test_c1_control_stripped(self):
-        assert (
-            normalize_text("Num\u0092ro d\u0092identification")
-            == "num ro d identification"
-        )
+        assert normalize_text("Num\u0092ro d\u0092identification") == "num ro d identification"
 
     def test_acute_accent_apostrophe(self):
         assert normalize_text("d\u00b4etudiant") == "d etudiant"
@@ -253,9 +250,7 @@ class TestDetectColumn:
 
 class TestDetectAllColumns:
     def test_single_match(self):
-        assert detect_all_columns(["Numéro étudiant", "Note"], "id") == [
-            "Numéro étudiant"
-        ]
+        assert detect_all_columns(["Numéro étudiant", "Note"], "id") == ["Numéro étudiant"]
 
     def test_multiple_matches(self):
         cols = ["Numero", "Prenom", "Numero etudiant", "Note"]
@@ -394,9 +389,7 @@ class TestReadFile:
 
     def test_xlsx(self, tmp_path):
         p = tmp_path / "data.xlsx"
-        pd.DataFrame({"A": ["1"], "B": ["x"]}).to_excel(
-            p, index=False, engine="openpyxl"
-        )
+        pd.DataFrame({"A": ["1"], "B": ["x"]}).to_excel(p, index=False, engine="openpyxl")
         df = read_file(p)
         assert list(df.columns) == ["A", "B"]
 
@@ -454,21 +447,21 @@ class TestMultiSheet:
     def test_xlsx_multi_sheet_all_grade_data(self, tmp_path):
         p = tmp_path / "data.xlsx"
         with pd.ExcelWriter(p, engine="openpyxl") as writer:
-            pd.DataFrame(
-                {"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}
-            ).to_excel(writer, sheet_name="DC-1", index=False)
-            pd.DataFrame(
-                {"Numéro étudiant": ["2"], "Prénom": ["B"], "Note": ["14"]}
-            ).to_excel(writer, sheet_name="DC-2", index=False)
+            pd.DataFrame({"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}).to_excel(
+                writer, sheet_name="DC-1", index=False
+            )
+            pd.DataFrame({"Numéro étudiant": ["2"], "Prénom": ["B"], "Note": ["14"]}).to_excel(
+                writer, sheet_name="DC-2", index=False
+            )
         sheets = read_file_sheets(p)
         assert len(sheets) == 2
 
     def test_xlsx_skips_non_grade_sheets(self, tmp_path):
         p = tmp_path / "data.xlsx"
         with pd.ExcelWriter(p, engine="openpyxl") as writer:
-            pd.DataFrame(
-                {"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}
-            ).to_excel(writer, sheet_name="Grades", index=False)
+            pd.DataFrame({"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}).to_excel(
+                writer, sheet_name="Grades", index=False
+            )
             pd.DataFrame({"Foo": ["bar"], "Baz": ["qux"]}).to_excel(
                 writer, sheet_name="Metadata", index=False
             )
@@ -632,6 +625,35 @@ class TestProcessTaFile:
         )
         report = process_ta_file(p, master, interactive=False)
         assert report.grades_assigned == 0
+
+    def test_swapped_first_last_name_recovered(self, tmp_path):
+        """TA put surname in Prénom column and vice versa — should still match."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        # No ID column → forces name fallback. Jean Dupont swapped.
+        _write_csv(
+            p,
+            ["Prénom", "Nom", "Note"],
+            [["Dupont", "Jean", "15"]],
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+        assert any("swapping" in w.lower() for w in report.warnings)
+
+    def test_swap_only_used_when_original_fails(self, tmp_path):
+        """Original-order match must take precedence over swap."""
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Prénom", "Nom", "Note"],
+            [["Jean", "Dupont", "15"]],  # correct order
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert report.grades_assigned == 1
+        # No swap warning — original order matched
+        assert not any("swapping" in w.lower() for w in report.warnings)
 
 
 # ============================================================================
@@ -1128,7 +1150,4 @@ class TestIntegration:
         df = pd.read_csv(out, dtype=str, keep_default_na=False)
         assert "Partiel" in df.columns
         assert "Numéro d'identification" in df.columns
-        assert (
-            df.loc[df["Numéro d'identification"] == "S002", "Partiel"].values[0]
-            == "ABS"
-        )
+        assert df.loc[df["Numéro d'identification"] == "S002", "Partiel"].values[0] == "ABS"

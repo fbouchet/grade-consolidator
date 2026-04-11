@@ -315,9 +315,7 @@ def detect_grade_column(
                 break
 
     if len(prefix_matches) == 1:
-        warnings.append(
-            f"  Grade column detected by prefix match: '{prefix_matches[0]}'."
-        )
+        warnings.append(f"  Grade column detected by prefix match: '{prefix_matches[0]}'.")
         return prefix_matches[0], warnings, []
     if len(prefix_matches) > 1:
         warnings.append(
@@ -340,9 +338,7 @@ def detect_grade_column(
         )
         return candidates[0], warnings, []
     if len(candidates) > 1:
-        warnings.append(
-            f"  AMBIGUOUS: multiple numeric candidate columns: {candidates}."
-        )
+        warnings.append(f"  AMBIGUOUS: multiple numeric candidate columns: {candidates}.")
         return None, warnings, candidates
 
     warnings.append("  No grade column found in this file.")
@@ -579,9 +575,7 @@ def _has_utf7_sequences(df: pd.DataFrame) -> bool:
 
 def _read_single_sheet(path: Path, engine: str, sheet: str | int = 0) -> pd.DataFrame:
     """Read a single sheet from an Excel file with standard cleaning."""
-    df = clean_column_names(
-        pd.read_excel(path, engine=engine, sheet_name=sheet, dtype=str)
-    )
+    df = clean_column_names(pd.read_excel(path, engine=engine, sheet_name=sheet, dtype=str))
     header_row = find_header_row(df)
     if header_row is not None:
         df = clean_column_names(promote_header_row(df, header_row))
@@ -661,17 +655,13 @@ def read_file(path: str | Path) -> pd.DataFrame:
         for enc in _CSV_ENCODINGS:
             try:
                 df = clean_column_names(
-                    pd.read_csv(
-                        path, sep=None, engine="python", encoding=enc, dtype=str
-                    )
+                    pd.read_csv(path, sep=None, engine="python", encoding=enc, dtype=str)
                 )
                 break
             except (UnicodeDecodeError, pd.errors.ParserError):
                 continue
         if df is None:
-            raise ValueError(
-                f"Could not read '{path}' with any of the attempted encodings."
-            )
+            raise ValueError(f"Could not read '{path}' with any of the attempted encodings.")
         # Post-read UTF-7 detection
         if _has_utf7_sequences(df):
             with contextlib.suppress(UnicodeDecodeError, pd.errors.ParserError):
@@ -810,9 +800,7 @@ def _resolve_column(
         override_col = overrides[role]
         if override_col in cols:
             label = _ROLE_LABELS.get(role, role)
-            report.warnings.append(
-                f"  Using saved override for {label}: '{override_col}'."
-            )
+            report.warnings.append(f"  Using saved override for {label}: '{override_col}'.")
             return override_col, new_overrides
         report.warnings.append(
             f"  Saved override '{override_col}' for {role} not found in columns. "
@@ -836,9 +824,7 @@ def _resolve_column(
                 )
                 new_overrides[role] = chosen
             return chosen, new_overrides
-        report.warnings.append(
-            f"  Using first match: '{matches[0]}' (non-interactive mode)."
-        )
+        report.warnings.append(f"  Using first match: '{matches[0]}' (non-interactive mode).")
         return matches[0], new_overrides
 
 
@@ -973,15 +959,11 @@ def process_ta_file(
             if grade_col is None and ambiguous and interactive:
                 grade_col = prompt_column_choice(ambiguous, path.name, "grade")
                 if grade_col is not None:
-                    report.warnings.append(
-                        f"  Grade column manually selected: '{grade_col}'."
-                    )
+                    report.warnings.append(f"  Grade column manually selected: '{grade_col}'.")
                     grade_ov["grade"] = grade_col
 
         if grade_col is None:
-            report.warnings.append(
-                f"  No grade column found{sheet_label}. Skipping sheet."
-            )
+            report.warnings.append(f"  No grade column found{sheet_label}. Skipping sheet.")
             continue
 
         # Collect per-sheet overrides
@@ -1035,9 +1017,7 @@ def process_ta_file(
                             master_full_norm = f"{expected_fn} {expected_ln}"
                             ta_full_norm = f"{got_fn} {got_ln}"
                             if master_full_norm != ta_full_norm:
-                                master_full = (
-                                    f"{student.first_name} {student.last_name}"
-                                )
+                                master_full = f"{student.first_name} {student.last_name}"
                                 ta_full = f"{fn_raw} {ln_raw}"
 
                                 if sid in confirmed_ids:
@@ -1109,8 +1089,24 @@ def process_ta_file(
                 matches = master.by_name.get(nk, [])
                 match_desc = f"name='{fn_raw} {ln_raw}'"
 
+                # If no match in original order, try swapping first/last —
+                # some TAs put surname in the "Prénom" column and vice versa
+                swap_used = False
+                if not matches:
+                    swapped_nk = make_name_key(ln_raw, fn_raw)
+                    swapped_matches = master.by_name.get(swapped_nk, [])
+                    if len(swapped_matches) == 1:
+                        matches = swapped_matches
+                        swap_used = True
+
                 if len(matches) == 1:
                     student = matches[0]
+                    if swap_used:
+                        report.warnings.append(
+                            f"  Row {row_idx}: name '{fn_raw} {ln_raw}' "
+                            f"matched after swapping first/last → "
+                            f"{student.first_name} {student.last_name}."
+                        )
                 elif len(matches) > 1:
                     report.warnings.append(
                         f"  Row {row_idx}: name '{fn_raw} {ln_raw}' matches "
@@ -1120,7 +1116,8 @@ def process_ta_file(
                     continue
                 else:
                     report.warnings.append(
-                        f"  Row {row_idx}: {match_desc} not found in master. Skipping row."
+                        f"  Row {row_idx}: {match_desc} not found in master "
+                        "(tried swapped order too). Skipping row."
                     )
                     continue
 
@@ -1308,8 +1305,7 @@ def print_summary(
             ):
                 print(f"    {C.warn(w)}")
             elif any(
-                kw in wl
-                for kw in ("saved override", "previously confirmed", "saved sheet")
+                kw in wl for kw in ("saved override", "previously confirmed", "saved sheet")
             ):
                 print(f"    {C.dim(w)}")
             else:
@@ -1319,9 +1315,7 @@ def print_summary(
     if missing:
         print(f"\n  {C.error(f'Students without any grade ({len(missing)}):')}")
         for s in missing:
-            print(
-                f"    {C.warn('-')} {s.last_name}, {s.first_name} (ID={s.student_id})"
-            )
+            print(f"    {C.warn('-')} {s.last_name}, {s.first_name} (ID={s.student_id})")
 
     print(C.bold("=" * 60) + "\n")
 
@@ -1387,9 +1381,7 @@ def load_config(config_path: str | Path) -> dict:
     has_dir = "grade_dir" in cfg and isinstance(cfg.get("grade_dir"), str)
 
     if not has_files and not has_dir:
-        raise ValueError(
-            "Config must specify 'grade_files' (list) and/or 'grade_dir' (path)."
-        )
+        raise ValueError("Config must specify 'grade_files' (list) and/or 'grade_dir' (path).")
 
     cfg.setdefault("output_file", "grades_consolidated.csv")
     return cfg
