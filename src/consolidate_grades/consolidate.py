@@ -6,13 +6,14 @@ Consolidate student grades from multiple TA files (CSV / XLSX / ODS)
 into a single Moodle-compatible CSV, using a master student roster as reference.
 
 Usage:
-    python consolidate_grades.py config.yaml
-    python consolidate_grades.py --help
+    consolidate-grades config.yaml
+    python -m consolidate_grades.consolidate config.yaml
 """
 
 import argparse
 import contextlib
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,63 +22,102 @@ import pandas as pd
 import yaml
 
 # ============================================================================
-# 1. COLUMN NAME DETECTION
+# 0. COLORED OUTPUT
 # ============================================================================
 
-# Canonical aliases for each semantic role.
-# All entries are stored *already normalised* (lowercase, no accents, etc.)
+
+class _Colors:
+    """ANSI color helpers, auto-disabled when stdout is not a terminal."""
+
+    def __init__(self) -> None:
+        self.enabled = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    def _wrap(self, code: str, text: str) -> str:
+        if not self.enabled:
+            return text
+        return f"{code}{text}\033[0m"
+
+    def info(self, text: str) -> str:
+        return self._wrap("\033[36m", text)  # cyan
+
+    def ok(self, text: str) -> str:
+        return self._wrap("\033[32m", text)  # green
+
+    def warn(self, text: str) -> str:
+        return self._wrap("\033[33m", text)  # yellow
+
+    def error(self, text: str) -> str:
+        return self._wrap("\033[31m", text)  # red
+
+    def bold(self, text: str) -> str:
+        return self._wrap("\033[1m", text)
+
+    def dim(self, text: str) -> str:
+        return self._wrap("\033[2m", text)
+
+
+C = _Colors()
+
+
+# ============================================================================
+# 1. COLUMN ALIASES & NORMALISATION
+# ============================================================================
+
+
 COLUMN_ALIASES: dict[str, list[str]] = {
     "id": [
-        "id",
-        "numero etudiant",
-        "num etudiant",
-        "num_etudiant",
-        "student id",
-        "student_id",
-        "studentid",
-        "n etudiant",
-        "no etudiant",
-        "no_etudiant",
-        "identifiant",
-        "nip",
-        "code etudiant",
-        "code_etudiant",
         "numero",
+        "numero etudiant",
+        "numero d etudiant",
+        "no etudiant",
+        "no d etudiant",
+        "n etudiant",
+        "num etudiant",
+        "code etudiant",
         "numero d identification",
         "no d identification",
-        "numero d etudiant",
-        "no d etudiant",
+        "identifiant",
+        "nip",
+        "id",
+        "student id",
+        "studentid",
     ],
     "first_name": [
         "prenom",
         "first name",
-        "first_name",
         "firstname",
         "given name",
-        "givenname",
     ],
     "last_name": [
         "nom",
         "nom de famille",
         "last name",
-        "last_name",
         "lastname",
+        "surname",
         "family name",
-        "family_name",
-        "familyname",
-        "nom famille",
-        "nom_famille",
+    ],
+    "full_name": [
+        "nom etu",
+        "nom etudiant",
+        "nom et prenom",
+        "prenom et nom",
+        "nom prenom",
+        "prenom nom",
+        "nom complet",
+        "full name",
+        "fullname",
+        "etudiant",
+        "student",
+        "name",
     ],
     "email": [
         "email",
-        "mail",
-        "courriel",
-        "adresse email",
-        "adresse mail",
-        "adresse_email",
-        "adresse de courriel",
         "e-mail",
-        "email address",
+        "courriel",
+        "adresse de courriel",
+        "adresse mail",
+        "adresse email",
+        "mail",
     ],
     "grade": [
         "note",
@@ -85,17 +125,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "grade",
         "score",
         "resultat",
-        "result",
         "mark",
         "points",
-        "notation",
         "note finale",
-        "note_finale",
-        "final grade",
-        "final_grade",
         "total",
         "total general",
-        "note totale",
     ],
 }
 
@@ -110,10 +144,13 @@ def normalize_text(text: str) -> str:
     - decompose unicode and drop combining characters (accents)
     - replace all dash variants, underscores, and apostrophe-like characters
       with spaces
-    - collapse whitespace (this also merges "--", "- -", etc. into one space)
+    - collapse whitespace
     """
     text = text.strip().lower()
     text = re.sub(r"[\u0080-\u009F]", " ", text)  # strip C1 controls
+    # ° / º → 'o', inserting a space before the next character if needed
+    # (e.g. "N°étudiant" → "no étudiant", not "noétudiant")
+    text = re.sub(r"[°º](\S)", r"o \1", text)
     text = re.sub(r"[°º]", "o", text)
     nfkd = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in nfkd if not unicodedata.combining(c))
@@ -136,16 +173,13 @@ def normalize_text(text: str) -> str:
     return text
 
 
-# Characters to strip from the start of column names (BOM, zero-width spaces, etc.)
-_COLUMN_GARBAGE = "\ufeff\u200b\u200c\u200d\ufffe"
+# Characters to strip from the start/end of column names
+_COLUMN_GARBAGE = "\ufeff\u200b\u200c\u200d "
 
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Strip BOM markers, zero-width characters, and surrounding whitespace
-    from all column names.  Returns the DataFrame (modified in place).
-    """
-    df.columns = [col.strip(_COLUMN_GARBAGE).strip() for col in df.columns]
+    """Strip BOM markers, zero-width spaces, and surrounding whitespace."""
+    df.columns = [str(col).strip(_COLUMN_GARBAGE).strip() for col in df.columns]
     return df
 
 
@@ -164,20 +198,16 @@ def _count_alias_matches(values: list[str]) -> int:
 
 def find_header_row(df: pd.DataFrame) -> int | None:
     """
-    Check whether the current DataFrame column headers look like real headers.
-    If not, scan the first 10 data rows for a row with more alias matches.
-
-    Returns the 0-based *data row index* to promote to header, or None if the
-    current headers are already the best candidate.
-
-    This handles files where TAs have put a title, corrector info, or other
-    metadata in the rows above the actual column headers.
+    Check if the current DataFrame headers look like real headers; if not,
+    scan the first 10 data rows for one with more alias matches.
+    Returns the 0-based data row index to promote, or None if current headers
+    are already best.
     """
     current_matches = _count_alias_matches(
         [str(c) for c in df.columns if str(c).strip() and str(c).lower() != "nan"]
     )
     if current_matches >= 2:
-        return None  # Current headers look fine
+        return None
 
     best_row: int | None = None
     best_count = current_matches
@@ -197,9 +227,7 @@ def find_header_row(df: pd.DataFrame) -> int | None:
 
 
 def promote_header_row(df: pd.DataFrame, row_idx: int) -> pd.DataFrame:
-    """
-    Promote a data row to column headers and drop all rows above it.
-    """
+    """Promote a data row to column headers and drop all rows above it."""
     new_headers = [str(v).strip() if pd.notna(v) else "" for v in df.iloc[row_idx]]
     df = df.iloc[row_idx + 1 :].reset_index(drop=True)
     df.columns = new_headers
@@ -207,12 +235,7 @@ def promote_header_row(df: pd.DataFrame, row_idx: int) -> pd.DataFrame:
 
 
 def detect_column(columns: list[str], role: str) -> str | None:
-    """
-    Given a list of DataFrame column names, return the *first* column name
-    that matches the semantic ``role``.  Returns ``None`` if no match found.
-
-    Use ``detect_all_columns`` when you need to detect ambiguity.
-    """
+    """Return the first column matching the role, or None."""
     aliases = {normalize_text(a) for a in COLUMN_ALIASES.get(role, [])}
     for col in columns:
         if normalize_text(col) in aliases:
@@ -221,87 +244,93 @@ def detect_column(columns: list[str], role: str) -> str | None:
 
 
 def detect_all_columns(columns: list[str], role: str) -> list[str]:
-    """
-    Return *all* column names that match the semantic ``role``.
-    Used to detect ambiguity (e.g. both 'Numero' and 'Numero etudiant').
-    """
+    """Return all columns matching the role."""
     aliases = {normalize_text(a) for a in COLUMN_ALIASES.get(role, [])}
     return [col for col in columns if normalize_text(col) in aliases]
+
+
+# ============================================================================
+# 2. GRADE COLUMN DETECTION
+# ============================================================================
+
+
+_QUESTION_PATTERN = re.compile(r"^q\d+$")
+
+
+def _looks_numeric_grade(series: pd.Series) -> bool:
+    """Check whether a column looks like grades (numeric values 0-25 or absent)."""
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return False
+    valid = 0
+    for v in non_null:
+        s = str(v).strip().replace(",", ".")
+        if s == "" or s.lower() == "nan":
+            continue
+        if s.upper() in ABSENT_TOKENS:
+            valid += 1
+            continue
+        try:
+            f = float(s)
+            if 0 <= f <= 25:
+                valid += 1
+        except ValueError:
+            pass
+    return valid >= max(1, int(0.5 * len(non_null)))
 
 
 def detect_grade_column(
     df: pd.DataFrame, known_columns: set[str]
 ) -> tuple[str | None, list[str], list[str]]:
     """
-    Detect the grade column in *df*.
-
-    Strategy:
-      1. Exact name-based matching using COLUMN_ALIASES["grade"].
-      2. Prefix matching: column name starts with a grade alias followed by
-         a separator (e.g. "Note /20", "Score final").
-      3. Content-based: find columns that are >= 50 % numeric-like (including
-         ABS / DEF / ABJ tokens), excluding columns already assigned a role.
-         If multiple candidates, prefer one named "Total" (or similar)
-         when sub-score columns (Q1, Q2, ...) are present.
-
-    Returns (column_name_or_None, list_of_warnings, ambiguous_candidates).
-    The third element is non-empty only when detection was ambiguous.
+    Detect the grade column.
+    Returns (column_name, warnings, ambiguous_candidates).
     """
     warnings: list[str] = []
-    grade_aliases = {normalize_text(a) for a in COLUMN_ALIASES["grade"]}
+    cols = [c for c in df.columns if c not in known_columns]
 
-    # 1. Exact name match
-    by_name = detect_column(list(df.columns), "grade")
-    if by_name is not None:
-        return by_name, warnings, []
+    # 1. Exact alias match
+    exact_matches = detect_all_columns(cols, "grade")
+    # Prefer "Total" over Q1-Q14 sub-scores
+    if exact_matches:
+        total_matches = [
+            m for m in exact_matches if normalize_text(m) in ("total", "total general")
+        ]
+        if total_matches:
+            return total_matches[0], warnings, []
+        if len(exact_matches) == 1:
+            return exact_matches[0], warnings, []
+        # Multiple exact matches → ambiguous
+        return None, warnings, exact_matches
 
-    # 2. Prefix match: column starts with a grade alias + separator
-    prefix_matches: list[str] = []
-    for col in df.columns:
+    # 2. Prefix match (e.g. "Note /20", "Notes sur 23")
+    grade_aliases = [normalize_text(a) for a in COLUMN_ALIASES["grade"]]
+    prefix_matches = []
+    for col in cols:
         norm = normalize_text(col)
         for alias in grade_aliases:
-            if norm.startswith(alias) and len(norm) > len(alias):
-                # Must be followed by a separator-like char (space, /)
-                rest = norm[len(alias) :]
-                if rest[0] in (" ", "/"):
+            if norm.startswith(alias + " ") or norm == alias:
+                if col not in prefix_matches:
                     prefix_matches.append(col)
-                    break
+                break
 
     if len(prefix_matches) == 1:
         warnings.append(
             f"  Grade column detected by prefix match: '{prefix_matches[0]}'."
         )
         return prefix_matches[0], warnings, []
-    elif len(prefix_matches) > 1:
+    if len(prefix_matches) > 1:
         warnings.append(
             f"  AMBIGUOUS: multiple grade-like columns by prefix: {prefix_matches}."
         )
         return None, warnings, prefix_matches
 
-    # 3. Content-based
-    grade_tokens = {"ABS", "DEF", "ABJ", "ABI", ""}
-    candidates: list[str] = []
-
-    for col in df.columns:
-        if col in known_columns:
+    # 3. Content-based fallback: find a numeric column that's not a Q1-Q14
+    candidates = []
+    for col in cols:
+        if _QUESTION_PATTERN.match(normalize_text(col)):
             continue
-        series = df[col].dropna().astype(str)
-        if len(series) == 0:
-            continue
-        numeric_like = 0
-        for val in series:
-            cleaned = val.strip().replace(",", ".").upper()
-            if cleaned in grade_tokens:
-                numeric_like += 1
-                continue
-            # strip trailing "/xx" (e.g. "15/20")
-            cleaned = re.sub(r"/\s*\d+(\.\d+)?$", "", cleaned)
-            try:
-                float(cleaned)
-                numeric_like += 1
-            except ValueError:
-                pass
-        if numeric_like / len(series) >= 0.5:
+        if _looks_numeric_grade(df[col]):
             candidates.append(col)
 
     if len(candidates) == 1:
@@ -310,30 +339,225 @@ def detect_grade_column(
             "(no column name match)."
         )
         return candidates[0], warnings, []
-    elif len(candidates) > 1:
-        # Heuristic: if there are sub-score columns (Q1, Q2, ...) and one
-        # candidate looks like a summary column, prefer it.
-        summary_aliases = {"total", "total general", "note totale", "somme", "sum"}
-        summary_cols = [c for c in candidates if normalize_text(c) in summary_aliases]
-        has_subscores = any(re.match(r"^[Qq]\d+$", c.strip()) for c in df.columns)
-
-        if len(summary_cols) == 1 and has_subscores:
-            warnings.append(
-                f"  Grade column auto-detected as summary column: "
-                f"'{summary_cols[0]}' (sub-score columns present)."
-            )
-            return summary_cols[0], warnings, []
-
-        warnings.append(f"  AMBIGUOUS: multiple possible grade columns: {candidates}.")
+    if len(candidates) > 1:
+        warnings.append(
+            f"  AMBIGUOUS: multiple numeric candidate columns: {candidates}."
+        )
         return None, warnings, candidates
-    else:
-        warnings.append("  No grade column detected. Skipping this file.")
-        return None, warnings, []
+
+    warnings.append("  No grade column found in this file.")
+    return None, warnings, []
 
 
 # ============================================================================
-# 2. FILE READING
+# 3. NAME NORMALISATION & MATCHING
 # ============================================================================
+
+
+def normalize_name(name: str) -> str:
+    """Normalise a student name for comparison."""
+    return normalize_text(name)
+
+
+def make_name_key(first: str, last: str) -> str:
+    """Canonical key from first + last name."""
+    return f"{normalize_name(last)}|{normalize_name(first)}"
+
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute the Levenshtein (edit) distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def name_similarity_hint(dist: int, max_len: int) -> str:
+    """Human-readable hint about name similarity."""
+    if dist == 0:
+        return "identical"
+    if max_len == 0:
+        return "empty"
+    ratio = dist / max_len
+    if ratio <= 0.15:
+        return "very similar (likely typo)"
+    if ratio <= 0.35:
+        return "somewhat similar"
+    return "very different (possibly wrong student)"
+
+
+def prompt_name_mismatch(
+    sid: str,
+    master_name: str,
+    ta_name: str,
+    filename: str,
+) -> bool:
+    """
+    Interactively confirm an ID match despite a name mismatch.
+    Returns True to proceed, False to skip.
+    """
+    norm_master = normalize_name(master_name)
+    norm_ta = normalize_name(ta_name)
+    dist = levenshtein_distance(norm_master, norm_ta)
+    max_len = max(len(norm_master), len(norm_ta))
+    hint = name_similarity_hint(dist, max_len)
+
+    msg = f"Name mismatch for ID '{sid}' in '{filename}':"
+    print(f"\n  {C.warn(msg)}")
+    print(f"    Master : {master_name}")
+    print(f"    TA file: {ta_name}")
+    print(f"    Edit distance: {dist} ({hint})")
+
+    while True:
+        try:
+            raw = input("  Proceed with this match? [y/n]: ").strip().lower()
+        except EOFError:
+            print("  Please enter y or n.")
+            continue
+        if raw in ("y", "yes"):
+            print(f"  -> {C.ok('Confirmed.')}")
+            return True
+        if raw in ("n", "no"):
+            print(f"  -> {C.warn('Skipping this student.')}")
+            return False
+        print("  Please enter y or n.")
+
+
+# ============================================================================
+# 4. GRADE PARSING
+# ============================================================================
+
+ABSENT_TOKENS = {
+    "ABS",
+    "ABSENCE",
+    "ABSENT",
+    "ABJ",
+    "ABI",
+    "DEF",
+    "DEFAILLANT",
+    "DÉFAILLANT",
+}
+
+
+@dataclass
+class ParsedGrade:
+    value: float | None = None
+    is_absent: bool = False
+    warning: str | None = None
+
+
+def parse_grade(raw) -> ParsedGrade:
+    """Parse a raw grade cell value."""
+    if raw is None:
+        return ParsedGrade()
+    s = str(raw).strip()
+    if s == "" or s.lower() == "nan":
+        return ParsedGrade(warning="empty cell")
+    if s.upper() in ABSENT_TOKENS:
+        return ParsedGrade(is_absent=True)
+    s = s.replace(",", ".")
+    try:
+        return ParsedGrade(value=float(s))
+    except ValueError:
+        return ParsedGrade(warning=f"could not parse grade value '{raw}'")
+
+
+# ============================================================================
+# 5. MASTER ROSTER
+# ============================================================================
+
+
+@dataclass
+class Student:
+    student_id: str
+    first_name: str
+    last_name: str
+    email: str
+    grade: float | None = None
+    is_absent: bool = False
+    grade_source: str | None = None
+
+
+@dataclass
+class MasterIndex:
+    by_id: dict[str, Student] = field(default_factory=dict)
+    by_name: dict[str, list[Student]] = field(default_factory=dict)
+    # Keyed by normalized full name in both orders ("jean dupont" and
+    # "dupont jean" both map to the same student) for merged-column matching.
+    by_full_name: dict[str, list[Student]] = field(default_factory=dict)
+    all_students: list[Student] = field(default_factory=list)
+
+
+def _normalize_full_name(text: str) -> str:
+    """Normalize a combined-name string for matching."""
+    return normalize_text(text)
+
+
+def build_master_index(df: pd.DataFrame) -> tuple[MasterIndex, list[str]]:
+    """Build a MasterIndex from the master DataFrame."""
+    warnings: list[str] = []
+    cols = list(df.columns)
+
+    id_col = detect_column(cols, "id")
+    fn_col = detect_column(cols, "first_name")
+    ln_col = detect_column(cols, "last_name")
+    em_col = detect_column(cols, "email")
+
+    missing = []
+    if id_col is None:
+        missing.append("id")
+    if fn_col is None:
+        missing.append("first_name")
+    if ln_col is None:
+        missing.append("last_name")
+    if missing:
+        raise ValueError(
+            f"Master file missing required column(s): {missing}. Found columns: {cols}"
+        )
+
+    index = MasterIndex()
+    for _, row in df.iterrows():
+        sid = str(row[id_col]).strip()
+        if not sid or sid.lower() == "nan":
+            continue
+        fn = str(row[fn_col]).strip() if pd.notna(row[fn_col]) else ""
+        ln = str(row[ln_col]).strip() if pd.notna(row[ln_col]) else ""
+        em = str(row[em_col]).strip() if em_col and pd.notna(row[em_col]) else ""
+
+        if sid in index.by_id:
+            warnings.append(f"  Duplicate student ID in master: {sid}. Keeping first.")
+            continue
+
+        student = Student(student_id=sid, first_name=fn, last_name=ln, email=em)
+        index.by_id[sid] = student
+        index.all_students.append(student)
+        nk = make_name_key(fn, ln)
+        index.by_name.setdefault(nk, []).append(student)
+        # Also index by full name in both orders to support merged-name columns
+        full_fl = _normalize_full_name(f"{fn} {ln}")
+        full_lf = _normalize_full_name(f"{ln} {fn}")
+        if full_fl:
+            index.by_full_name.setdefault(full_fl, []).append(student)
+        if full_lf and full_lf != full_fl:
+            index.by_full_name.setdefault(full_lf, []).append(student)
+
+    return index, warnings
+
+
+# ============================================================================
+# 6. FILE READING
+# ============================================================================
+
 
 _CSV_ENCODINGS = ["utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-7"]
 
@@ -354,7 +578,7 @@ def _has_utf7_sequences(df: pd.DataFrame) -> bool:
 
 
 def _read_single_sheet(path: Path, engine: str, sheet: str | int = 0) -> pd.DataFrame:
-    """Read a single sheet from an Excel file and apply standard cleaning."""
+    """Read a single sheet from an Excel file with standard cleaning."""
     df = clean_column_names(
         pd.read_excel(path, engine=engine, sheet_name=sheet, dtype=str)
     )
@@ -384,7 +608,8 @@ def read_file_sheets(
 
     For CSV files, returns a single pair with sheet_name="".
     For XLSX/ODS files, returns all sheets that look like grade data
-    (i.e. have at least 2 column alias matches).
+    (i.e. have at least 2 column alias matches), or all sheets if there's
+    only one.
     """
     path = Path(path)
     suffix = path.suffix.lower()
@@ -419,16 +644,10 @@ def read_file(path: str | Path) -> pd.DataFrame:
     """
     Read a tabular file (.csv, .xlsx, .ods) into a DataFrame.
 
-    CSV: tries several encodings and auto-detects the delimiter via the
-    Python csv sniffer (``sep=None, engine='python'``).
-
-    XLSX/ODS: reads the first sheet only (use ``read_file_sheets`` for
-    multi-sheet support).
-
-    All formats: column names are cleaned of BOM markers and zero-width
-    characters after reading.  If the first row doesn't look like headers
-    (e.g. a TA put a title row), scans the first 10 rows for the real
-    header row and promotes it.
+    CSV: tries several encodings; auto-detects delimiter via Python csv sniffer.
+    XLSX/ODS: reads first sheet only (use read_file_sheets for multi-sheet).
+    All formats: column names cleaned of BOM/zero-width chars; if first row
+    doesn't look like headers, scans first 10 rows for the real header row.
     """
     path = Path(path)
     suffix = path.suffix.lower()
@@ -453,8 +672,7 @@ def read_file(path: str | Path) -> pd.DataFrame:
             raise ValueError(
                 f"Could not read '{path}' with any of the attempted encodings."
             )
-        # Post-read check: if a non-UTF-7 encoding succeeded but column
-        # names/data contain UTF-7 escape sequences, re-read with UTF-7.
+        # Post-read UTF-7 detection
         if _has_utf7_sequences(df):
             with contextlib.suppress(UnicodeDecodeError, pd.errors.ParserError):
                 df = clean_column_names(
@@ -469,7 +687,7 @@ def read_file(path: str | Path) -> pd.DataFrame:
     else:
         raise ValueError(f"Unsupported file extension: '{suffix}' for file '{path}'.")
 
-    # Check if headers are in a later row (TA added title/metadata above)
+    # Check if headers are in a later row
     header_row = find_header_row(df)
     if header_row is not None:
         df = clean_column_names(promote_header_row(df, header_row))
@@ -478,232 +696,7 @@ def read_file(path: str | Path) -> pd.DataFrame:
 
 
 # ============================================================================
-# 3. NAME NORMALISATION & MATCHING
-# ============================================================================
-
-
-def normalize_name(name: str) -> str:
-    """
-    Normalise a student name for comparison:
-    lowercase, strip accents, normalise hyphens → spaces, collapse whitespace.
-    """
-    return normalize_text(name)
-
-
-def make_name_key(first: str, last: str) -> str:
-    """Canonical key from first + last name."""
-    return f"{normalize_name(last)}|{normalize_name(first)}"
-
-
-def levenshtein_distance(s1: str, s2: str) -> int:
-    """Compute the Levenshtein (edit) distance between two strings."""
-    if len(s1) < len(s2):
-        return levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    prev_row = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        curr_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = prev_row[j + 1] + 1
-            deletions = curr_row[j] + 1
-            substitutions = prev_row[j] + (c1 != c2)
-            curr_row.append(min(insertions, deletions, substitutions))
-        prev_row = curr_row
-    return prev_row[-1]
-
-
-def name_similarity_hint(dist: int, max_len: int) -> str:
-    """Return a human-readable hint about how similar two names are."""
-    if dist == 0:
-        return "identical"
-    if max_len == 0:
-        return "empty"
-    ratio = dist / max_len
-    if ratio <= 0.15:
-        return "very similar (likely typo)"
-    if ratio <= 0.35:
-        return "somewhat similar"
-    return "very different (possibly wrong student)"
-
-
-def prompt_name_mismatch(
-    sid: str,
-    master_name: str,
-    ta_name: str,
-    filename: str,
-) -> bool:
-    """
-    Interactively ask the user to confirm an ID match despite a name mismatch.
-
-    Shows the edit distance and a similarity hint.
-    Returns True to proceed with the match, False to skip.
-    """
-    norm_master = normalize_name(master_name)
-    norm_ta = normalize_name(ta_name)
-    dist = levenshtein_distance(norm_master, norm_ta)
-    max_len = max(len(norm_master), len(norm_ta))
-    hint = name_similarity_hint(dist, max_len)
-
-    print(f"\n  Name mismatch for ID '{sid}' in '{filename}':")
-    print(f"    Master : {master_name}")
-    print(f"    TA file: {ta_name}")
-    print(f"    Edit distance: {dist} ({hint})")
-
-    while True:
-        try:
-            raw = input("  Proceed with this match? [y/n]: ").strip().lower()
-        except EOFError:
-            print("  Please enter y or n.")
-            continue
-        if raw in ("y", "yes"):
-            print("  -> Confirmed.")
-            return True
-        if raw in ("n", "no"):
-            print("  -> Skipping this student.")
-            return False
-        print("  Please enter y or n.")
-
-
-# ============================================================================
-# 4. GRADE PARSING
-# ============================================================================
-
-# Tokens treated as "no grade" (absent, défaillant, …)
-ABSENT_TOKENS = {
-    "ABS",
-    "ABSENCE",
-    "ABSENT",
-    "ABJ",
-    "ABI",
-    "DEF",
-    "DEFAILLANT",
-    "DÉFAILLANT",
-}
-
-
-@dataclass
-class ParsedGrade:
-    """Result of parsing a raw grade string."""
-
-    value: float | None = None  # None if absent / unparseable
-    is_absent: bool = False
-    raw: str = ""
-    warning: str | None = None
-
-
-def parse_grade(raw) -> ParsedGrade:
-    """Parse a raw grade value into a numeric float or an absent marker."""
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return ParsedGrade(raw="", warning="empty cell")
-
-    raw_str = str(raw).strip()
-    if raw_str == "":
-        return ParsedGrade(raw=raw_str, warning="empty cell")
-
-    upper = raw_str.upper()
-    if upper in ABSENT_TOKENS:
-        return ParsedGrade(is_absent=True, raw=raw_str)
-
-    # Normalise: comma → dot, strip "/xx" suffix
-    cleaned = raw_str.replace(",", ".")
-    cleaned = re.sub(r"\s*/\s*\d+(\.\d+)?\s*$", "", cleaned)
-
-    try:
-        value = float(cleaned)
-        return ParsedGrade(value=value, raw=raw_str)
-    except ValueError:
-        return ParsedGrade(
-            raw=raw_str,
-            warning=f"could not parse grade value '{raw_str}'",
-        )
-
-
-# ============================================================================
-# 5. MASTER INDEX
-# ============================================================================
-
-
-@dataclass
-class Student:
-    """A student record from the master file."""
-
-    student_id: str
-    first_name: str
-    last_name: str
-    email: str
-    grade: float | None = None
-    grade_source: str | None = None  # which TA file set the grade
-    is_absent: bool = False
-    warnings: list[str] = field(default_factory=list)
-
-
-@dataclass
-class MasterIndex:
-    """Indexes for fast student lookup."""
-
-    by_id: dict[str, Student] = field(default_factory=dict)
-    by_name: dict[str, list[Student]] = field(default_factory=dict)
-    all_students: list[Student] = field(default_factory=list)
-
-
-def build_master_index(df: pd.DataFrame) -> tuple[MasterIndex, list[str]]:
-    """
-    Build lookup indexes from the master DataFrame.
-    Returns (MasterIndex, warnings).
-    """
-    warnings: list[str] = []
-    cols = list(df.columns)
-
-    id_col = detect_column(cols, "id")
-    fn_col = detect_column(cols, "first_name")
-    ln_col = detect_column(cols, "last_name")
-    em_col = detect_column(cols, "email")
-
-    missing = []
-    if id_col is None:
-        missing.append("student ID")
-    if fn_col is None:
-        missing.append("first name")
-    if ln_col is None:
-        missing.append("last name")
-    if em_col is None:
-        missing.append("email")
-    if missing:
-        raise ValueError(
-            f"Master file is missing required columns: {', '.join(missing)}. "
-            f"Available columns: {cols}"
-        )
-
-    index = MasterIndex()
-
-    for _, row in df.iterrows():
-        sid = str(row[id_col]).strip()
-        fn = str(row[fn_col]).strip()
-        ln = str(row[ln_col]).strip()
-        email = str(row[em_col]).strip()
-
-        student = Student(student_id=sid, first_name=fn, last_name=ln, email=email)
-        index.all_students.append(student)
-
-        # ID index
-        if sid in index.by_id:
-            warnings.append(
-                f"  Duplicate student ID '{sid}' in master file. "
-                "Keeping first occurrence."
-            )
-        else:
-            index.by_id[sid] = student
-
-        # Name index
-        nk = make_name_key(fn, ln)
-        index.by_name.setdefault(nk, []).append(student)
-
-    return index, warnings
-
-
-# ============================================================================
-# 6. PROCESS A SINGLE TA FILE
+# 7. PROCESS A SINGLE TA FILE
 # ============================================================================
 
 
@@ -735,11 +728,10 @@ def prompt_column_choice(
 ) -> str | None:
     """
     Interactively ask the user to choose among ambiguous column candidates.
-
     Returns the chosen column name, or None if the user chooses to skip.
     """
     label = _ROLE_LABELS.get(role, role)
-    print(f"\n  Multiple {label} columns detected in '{filename}':")
+    print(f"\n  {C.warn(f'Multiple {label} columns detected in {filename!r}:')}")
     for i, col in enumerate(candidates, 1):
         print(f"    {i}. {col}")
     print(f"    {len(candidates) + 1}. Skip this file")
@@ -753,10 +745,10 @@ def prompt_column_choice(
             continue
         if 1 <= choice <= len(candidates):
             chosen = candidates[choice - 1]
-            print(f"  -> Using '{chosen}'")
+            print(f"  -> {C.ok(f'Using {chosen!r}')}")
             return chosen
         elif choice == len(candidates) + 1:
-            print("  -> Skipping file.")
+            print(f"  -> {C.warn('Skipping file.')}")
             return None
         else:
             print(f"  Please enter a number between 1 and {len(candidates) + 1}.")
@@ -764,11 +756,10 @@ def prompt_column_choice(
 
 def prompt_sheet_selection(sheet_names: list[str], filename: str) -> list[str]:
     """
-    Interactively ask the user which sheets to process.
-
-    Returns the list of selected sheet names (may be empty to skip all).
+    Interactively ask which sheets to process.
+    Returns the selected sheet names (may be empty to skip all).
     """
-    print(f"\n  Multiple sheets found in '{filename}':")
+    print(f"\n  {C.warn(f'Multiple sheets found in {filename!r}:')}")
     for i, name in enumerate(sheet_names, 1):
         print(f"    {i}. {name}")
     print("  Enter sheet numbers to process (comma-separated), or 'all', or 'none':")
@@ -781,11 +772,10 @@ def prompt_sheet_selection(sheet_names: list[str], filename: str) -> list[str]:
             continue
 
         if raw == "all":
-            selected = list(sheet_names)
-            print(f"  -> Using all {len(selected)} sheets.")
-            return selected
+            print(f"  -> {C.ok(f'Using all {len(sheet_names)} sheets.')}")
+            return list(sheet_names)
         if raw in ("none", "skip", "0"):
-            print("  -> Skipping all sheets.")
+            print(f"  -> {C.warn('Skipping all sheets.')}")
             return []
 
         try:
@@ -796,7 +786,7 @@ def prompt_sheet_selection(sheet_names: list[str], filename: str) -> list[str]:
 
         if all(1 <= idx <= len(sheet_names) for idx in indices):
             selected = [sheet_names[idx - 1] for idx in indices]
-            print(f"  -> Using sheets: {selected}")
+            print(f"  -> {C.ok(f'Using sheets: {selected}')}")
             return selected
 
         print(f"  Numbers must be between 1 and {len(sheet_names)}.")
@@ -811,14 +801,11 @@ def _resolve_column(
     report: FileReport,
 ) -> tuple[str | None, dict[str, str]]:
     """
-    Resolve a column for a given role, checking overrides first, then
-    detecting, and prompting on ambiguity.
-
+    Resolve a column for a role: check overrides → detect → prompt on ambiguity.
     Returns (column_name_or_None, new_overrides_to_save).
     """
     new_overrides: dict[str, str] = {}
 
-    # 1. Check override
     if role in overrides:
         override_col = overrides[role]
         if override_col in cols:
@@ -832,7 +819,6 @@ def _resolve_column(
             "Falling back to detection."
         )
 
-    # 2. Detect
     matches = detect_all_columns(cols, role)
 
     if len(matches) == 1:
@@ -840,7 +826,6 @@ def _resolve_column(
     elif len(matches) == 0:
         return None, new_overrides
     else:
-        # Ambiguous
         label = _ROLE_LABELS.get(role, role)
         report.warnings.append(f"  AMBIGUOUS: multiple {label} columns: {matches}.")
         if interactive:
@@ -851,7 +836,6 @@ def _resolve_column(
                 )
                 new_overrides[role] = chosen
             return chosen, new_overrides
-        # Non-interactive: use first match
         report.warnings.append(
             f"  Using first match: '{matches[0]}' (non-interactive mode)."
         )
@@ -868,19 +852,18 @@ def process_ta_file(
 ) -> FileReport:
     """Process one TA grade file and update the master index in place.
 
-    ``file_overrides`` is the per-file override dict from YAML, which may
-    contain flat column overrides (single-sheet) or structured multi-sheet
-    overrides with ``selected_sheets`` and ``sheet_columns`` keys.
+    file_overrides: per-file override dict from YAML. May be flat
+    (single-sheet) or have ``selected_sheets`` and ``sheet_columns`` keys
+    (multi-sheet).
 
-    ``name_confirmations`` is an optional list of student IDs for which a
-    name mismatch was previously confirmed.
+    name_confirmations: student IDs for which a name mismatch was previously
+    confirmed.
     """
     path = Path(path)
     report = FileReport(filename=str(path))
     overrides = file_overrides or {}
     confirmed_ids = set(name_confirmations or [])
 
-    # Read all sheets (CSV returns one sheet with name "")
     try:
         all_sheets = read_file_sheets(path)
     except Exception as e:
@@ -902,7 +885,6 @@ def process_ta_file(
         saved_selection = overrides.get("selected_sheets")
 
         if saved_selection is not None:
-            # Use saved selection
             selected_names = [n for n in saved_selection if n in all_sheet_names]
             report.warnings.append(
                 f"  Using saved sheet selection: {selected_names} "
@@ -912,11 +894,9 @@ def process_ta_file(
             selected_names = prompt_sheet_selection(all_sheet_names, path.name)
             selected_sheets_changed = True
         else:
-            # Non-interactive: use all sheets with grade-like data
             selected_names = all_sheet_names
             report.warnings.append(
-                f"  Found {len(all_sheet_names)} sheets, "
-                "processing all (non-interactive)."
+                f"  Found {len(all_sheet_names)} sheets, processing all (non-interactive)."
             )
 
         if not selected_names:
@@ -933,8 +913,7 @@ def process_ta_file(
     # --- Per-sheet column overrides ---
     saved_sheet_columns: dict[str, dict[str, str]] = overrides.get("sheet_columns", {})
     new_sheet_columns: dict[str, dict[str, str]] = {}
-    # Shared overrides accumulate interactive choices across sheets,
-    # so a grade column chosen for DC-1 is reused for DC-2
+    # Shared overrides accumulate interactive choices across sheets
     shared_overrides: dict[str, str] = {}
 
     for sheet_name, df in sheets:
@@ -946,19 +925,14 @@ def process_ta_file(
 
         cols = list(df.columns)
 
-        # For multi-sheet: per-sheet overrides, falling back to shared
-        # For single-sheet: flat overrides (backward compatible)
         if is_multi:
             per_sheet = saved_sheet_columns.get(sheet_name, {})
-            # Merge: per-sheet overrides take priority over shared
             sheet_col_overrides = {**shared_overrides, **per_sheet}
         else:
             sheet_col_overrides = dict(overrides)
-            # Remove non-column keys
             sheet_col_overrides.pop("selected_sheets", None)
             sheet_col_overrides.pop("sheet_columns", None)
 
-        # Detect columns with override + ambiguity support
         id_col, id_ov = _resolve_column(
             "id", cols, sheet_col_overrides, path.name, interactive, report
         )
@@ -968,10 +942,14 @@ def process_ta_file(
         ln_col, ln_ov = _resolve_column(
             "last_name", cols, sheet_col_overrides, path.name, interactive, report
         )
+        # Merged "Nom étu" / "Nom prénom" / "Étudiant" style columns
+        full_col, full_ov = _resolve_column(
+            "full_name", cols, sheet_col_overrides, path.name, interactive, report
+        )
 
-        known_cols = {c for c in [id_col, fn_col, ln_col] if c is not None}
+        known_cols = {c for c in [id_col, fn_col, ln_col, full_col] if c is not None}
 
-        # Grade column: check override first, then use advanced detection
+        # Grade column
         grade_col: str | None = None
         grade_ov: dict[str, str] = {}
 
@@ -979,8 +957,7 @@ def process_ta_file(
             override_grade = sheet_col_overrides["grade"]
             if override_grade in cols:
                 report.warnings.append(
-                    f"  Using saved override for grade: "
-                    f"'{override_grade}'{sheet_label}."
+                    f"  Using saved override for grade: '{override_grade}'{sheet_label}."
                 )
                 grade_col = override_grade
             else:
@@ -1008,22 +985,22 @@ def process_ta_file(
             continue
 
         # Collect per-sheet overrides
-        this_sheet_ov = {**id_ov, **fn_ov, **ln_ov, **grade_ov}
+        this_sheet_ov = {**id_ov, **fn_ov, **ln_ov, **full_ov, **grade_ov}
         if this_sheet_ov:
             existing = new_sheet_columns.get(sheet_name, {})
             existing.update(this_sheet_ov)
             new_sheet_columns[sheet_name] = existing
-            # Feed into shared_overrides so next sheets can reuse
             shared_overrides.update(this_sheet_ov)
 
-        # Determine matching strategy
         use_id = id_col is not None
         use_name = fn_col is not None and ln_col is not None
+        use_full_name = full_col is not None
 
-        if not use_id and not use_name:
+        if not use_id and not use_name and not use_full_name:
             report.warnings.append(
                 f"  Sheet{sheet_label} has neither a student ID column nor "
-                "both first/last name columns. Skipping sheet."
+                "first/last name columns nor a merged full-name column. "
+                "Skipping sheet."
             )
             continue
 
@@ -1053,10 +1030,8 @@ def process_ta_file(
                             expected_ln = normalize_name(student.last_name)
                             got_fn = normalize_name(fn_raw)
                             got_ln = normalize_name(ln_raw)
-                            # Compare full concatenated names first — handles
-                            # cases where first/last split differs between
-                            # master and TA (e.g. "Mohamed Ayoub" / "Mebarki"
-                            # vs "Mohamed" / "Ayoub Mebarki")
+                            # Compare full concatenated names — handles
+                            # different first/last splits
                             master_full_norm = f"{expected_fn} {expected_ln}"
                             ta_full_norm = f"{got_fn} {got_ln}"
                             if master_full_norm != ta_full_norm:
@@ -1080,12 +1055,12 @@ def process_ta_file(
                                         report.new_name_confirmations.append(sid)
                                         report.warnings.append(
                                             f"  Row {row_idx}: ID '{sid}' name "
-                                            f"mismatch confirmed by user."
+                                            "mismatch confirmed by user."
                                         )
                                     else:
                                         report.warnings.append(
                                             f"  Row {row_idx}: ID '{sid}' name "
-                                            f"mismatch rejected by user. "
+                                            "mismatch rejected by user. "
                                             "Skipping row."
                                         )
                                         student = None
@@ -1100,13 +1075,18 @@ def process_ta_file(
                                     )
 
                     if student is None and sid:
-                        # ID not in master — try name fallback
                         if use_name:
                             fn_raw = str(row[fn_col]).strip()
                             ln_raw = str(row[ln_col]).strip()
                             report.warnings.append(
                                 f"  Row {row_idx}: ID '{sid}' not found in master. "
                                 f"Attempting name fallback ({fn_raw} {ln_raw})."
+                            )
+                        elif use_full_name:
+                            full_raw = str(row[full_col]).strip()
+                            report.warnings.append(
+                                f"  Row {row_idx}: ID '{sid}' not found in master. "
+                                f"Attempting full-name fallback ({full_raw})."
                             )
                         else:
                             report.warnings.append(
@@ -1115,7 +1095,7 @@ def process_ta_file(
                             )
                             continue
 
-            # Fallback to name matching (or primary if no ID column)
+            # Fallback to name matching
             if student is None and use_name:
                 fn_raw = str(row[fn_col]).strip()
                 ln_raw = str(row[ln_col]).strip()
@@ -1144,6 +1124,34 @@ def process_ta_file(
                     )
                     continue
 
+            # Fallback to full-name matching (merged name column)
+            if student is None and use_full_name:
+                full_raw = str(row[full_col]).strip()
+                if not full_raw or full_raw.lower() == "nan":
+                    report.warnings.append(
+                        f"  Row {row_idx}: missing full-name data. Skipping row."
+                    )
+                    continue
+
+                nk = _normalize_full_name(full_raw)
+                matches = master.by_full_name.get(nk, [])
+                match_desc = f"full_name='{full_raw}'"
+
+                if len(matches) == 1:
+                    student = matches[0]
+                elif len(matches) > 1:
+                    report.warnings.append(
+                        f"  Row {row_idx}: full name '{full_raw}' matches "
+                        f"{len(matches)} students in master. Skipping — "
+                        "manual check required."
+                    )
+                    continue
+                else:
+                    report.warnings.append(
+                        f"  Row {row_idx}: {match_desc} not found in master. Skipping row."
+                    )
+                    continue
+
             if student is None:
                 continue
 
@@ -1154,12 +1162,12 @@ def process_ta_file(
                 prev_src = student.grade_source or "unknown"
                 report.warnings.append(
                     f"  WARNING: student '{student.first_name} {student.last_name}' "
-                    f"(ID={student.student_id}) already has a grade from '{prev_src}'. "
-                    f"Duplicate found in '{path.name}'. Keeping first grade."
+                    f"(ID={student.student_id}) already has a grade from "
+                    f"'{prev_src}'. Duplicate found in '{path.name}'. "
+                    "Keeping first grade."
                 )
                 continue
 
-            # Assign grade
             if parsed.warning and not parsed.is_absent and parsed.value is None:
                 report.warnings.append(
                     f"  Row {row_idx}: {match_desc} — {parsed.warning}. No grade assigned."
@@ -1174,7 +1182,6 @@ def process_ta_file(
                 student.grade = parsed.value
                 student.grade_source = str(path.name)
                 report.grades_assigned += 1
-            # else: empty cell, leave ungraded
 
     # Build new file overrides for persistence
     new_ov: dict = {}
@@ -1184,14 +1191,12 @@ def process_ta_file(
         if new_sheet_columns:
             new_ov["sheet_columns"] = new_sheet_columns
     else:
-        # Single-sheet: flat structure (backward compatible)
         for _sheet_name, ov in new_sheet_columns.items():
             new_ov.update(ov)
 
     if new_ov:
         report.new_file_overrides = new_ov
 
-    # If no sheets yielded any matches, mark as skipped
     if report.students_matched == 0 and report.grades_assigned == 0:
         report.skipped = True
 
@@ -1199,14 +1204,20 @@ def process_ta_file(
 
 
 # ============================================================================
-# 7. OUTPUT
+# 8. OUTPUT
 # ============================================================================
 
 
-def write_moodle_csv(master: MasterIndex, output_path: str | Path) -> None:
+def write_moodle_csv(
+    master: MasterIndex,
+    output_path: str | Path,
+    *,
+    exam_name: str = "Grade",
+    id_column_name: str = "Numéro d'identification",
+) -> None:
     """
-    Write a Moodle-compatible CSV.
-    Columns: Identifier, Email address, First name, Last name, Grade
+    Write a Moodle-compatible CSV with French column names by default.
+    Both column names are configurable for Moodle import.
     """
     output_path = Path(output_path)
     rows = []
@@ -1215,15 +1226,14 @@ def write_moodle_csv(master: MasterIndex, output_path: str | Path) -> None:
         if s.is_absent:
             grade_str = "ABS"
         elif s.grade is not None:
-            # Format: no unnecessary decimals
             grade_str = f"{s.grade:g}"
         rows.append(
             {
-                "Identifier": s.student_id,
-                "Email address": s.email,
-                "First name": s.first_name,
-                "Last name": s.last_name,
-                "Grade": grade_str,
+                id_column_name: s.student_id,
+                "Adresse de courriel": s.email,
+                "Prénom": s.first_name,
+                "Nom de famille": s.last_name,
+                exam_name: grade_str,
             }
         )
 
@@ -1232,7 +1242,7 @@ def write_moodle_csv(master: MasterIndex, output_path: str | Path) -> None:
 
 
 # ============================================================================
-# 8. SUMMARY
+# 9. SUMMARY
 # ============================================================================
 
 
@@ -1240,8 +1250,11 @@ def print_summary(
     master: MasterIndex,
     reports: list[FileReport],
     output_path: str,
+    *,
+    exam_name: str = "Grade",
+    id_column_name: str = "Numéro d'identification",
 ) -> None:
-    """Print a human-readable summary of the consolidation."""
+    """Print a human-readable summary with colors."""
     total_students = len(master.all_students)
     graded = sum(1 for s in master.all_students if s.grade is not None)
     absent = sum(1 for s in master.all_students if s.is_absent)
@@ -1250,42 +1263,71 @@ def print_summary(
     files_ok = sum(1 for r in reports if not r.skipped)
     files_skipped = sum(1 for r in reports if r.skipped)
 
-    print("\n" + "=" * 60)
-    print("CONSOLIDATION SUMMARY")
-    print("=" * 60)
-    print(f"  Master roster          : {total_students} students")
-    print(f"  TA files processed     : {files_ok}")
-    print(f"  TA files skipped       : {files_skipped}")
-    print(f"  Students with grade    : {graded}")
-    print(f"  Students absent (ABS…) : {absent}")
-    print(f"  Students without grade : {no_grade}")
-    print(f"  Output file            : {output_path}")
+    print("\n" + C.bold("=" * 60))
+    print(C.bold("CONSOLIDATION SUMMARY"))
+    print(C.bold("=" * 60))
+    print(f"  {C.info('Exam name')}             : {C.bold(exam_name)}")
+    print(f"  {C.info('ID column name')}        : {C.bold(id_column_name)}")
+    print(f"  {C.info('Master roster')}         : {total_students} students")
+    print(f"  {C.info('TA files processed')}    : {files_ok}")
+    if files_skipped:
+        print(f"  {C.warn('TA files skipped')}     : {files_skipped}")
+    else:
+        print(f"  {C.info('TA files skipped')}     : 0")
+    print(f"  {C.ok('Students with grade')}   : {graded}")
+    if absent:
+        print(f"  {C.warn('Students absent')}      : {absent}")
+    if no_grade:
+        print(f"  {C.error('Students without grade')}: {no_grade}")
+    else:
+        print(f"  {C.ok('Students without grade')}: 0")
+    print(f"  {C.info('Output file')}           : {output_path}")
 
-    # Per-file details
     for r in reports:
-        status = "SKIPPED" if r.skipped else "OK"
-        print(f"\n  [{status}] {r.filename}")
-        if not r.skipped:
+        if r.skipped:
+            print(f"\n  [{C.error('SKIPPED')}] {r.filename}")
+        else:
+            print(f"\n  [{C.ok('OK')}] {r.filename}")
             print(
                 f"    matched={r.students_matched}  "
                 f"grades={r.grades_assigned}  "
                 f"absent={r.students_absent}"
             )
         for w in r.warnings:
-            print(f"    {w}")
+            wl = w.lower()
+            if any(
+                kw in wl
+                for kw in (
+                    "ambiguous",
+                    "warning",
+                    "not found",
+                    "skipping",
+                    "rejected",
+                    "could not",
+                )
+            ):
+                print(f"    {C.warn(w)}")
+            elif any(
+                kw in wl
+                for kw in ("saved override", "previously confirmed", "saved sheet")
+            ):
+                print(f"    {C.dim(w)}")
+            else:
+                print(f"    {w}")
 
-    # List students without a grade
     missing = [s for s in master.all_students if s.grade is None and not s.is_absent]
     if missing:
-        print(f"\n  Students without any grade ({len(missing)}):")
+        print(f"\n  {C.error(f'Students without any grade ({len(missing)}):')}")
         for s in missing:
-            print(f"    - {s.last_name}, {s.first_name} (ID={s.student_id})")
+            print(
+                f"    {C.warn('-')} {s.last_name}, {s.first_name} (ID={s.student_id})"
+            )
 
-    print("=" * 60 + "\n")
+    print(C.bold("=" * 60) + "\n")
 
 
 # ============================================================================
-# 9. MAIN
+# 10. CONFIG & MAIN
 # ============================================================================
 
 
@@ -1297,10 +1339,7 @@ def resolve_grade_files(
     grade_files: list[str] | None = None,
     grade_dir: str | None = None,
 ) -> list[Path]:
-    """
-    Build the list of grade file paths from explicit file list, directory scan,
-    or both.  Deduplicates by resolved absolute path and sorts for determinism.
-    """
+    """Build the list of grade file paths from explicit list and/or directory scan."""
     seen: set[Path] = set()
     result: list[Path] = []
 
@@ -1310,7 +1349,6 @@ def resolve_grade_files(
             seen.add(resolved)
             result.append(p)
 
-    # Explicit file list
     if grade_files:
         for gf in grade_files:
             gf_path = Path(gf)
@@ -1318,7 +1356,6 @@ def resolve_grade_files(
                 gf_path = config_dir / gf_path
             _add(gf_path)
 
-    # Directory scan
     if grade_dir:
         dir_path = Path(grade_dir)
         if not dir_path.is_absolute():
@@ -1359,7 +1396,7 @@ def load_config(config_path: str | Path) -> dict:
 
 
 def save_config(config_path: str | Path, cfg: dict) -> None:
-    """Write the config dict back to the YAML file, preserving new overrides."""
+    """Write the config dict back to YAML."""
     config_path = Path(config_path)
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -1368,13 +1405,10 @@ def save_config(config_path: str | Path, cfg: dict) -> None:
 def consolidate(
     config_path: str | Path, *, interactive: bool = True
 ) -> tuple[MasterIndex, list[FileReport]]:
-    """
-    Run the full consolidation pipeline.
-    Returns (master_index, list_of_file_reports) for programmatic use.
-    """
+    """Run the full consolidation pipeline."""
     cfg = load_config(config_path)
+    config_changed = False
 
-    # Resolve paths relative to the config file location
     config_dir = Path(config_path).parent
 
     master_path = Path(cfg["master_file"])
@@ -1385,16 +1419,56 @@ def consolidate(
     if not output_path.is_absolute():
         output_path = config_dir / output_path
 
-    # Read master
-    print(f"Reading master file: {master_path}")
+    # --- Exam name and ID column name (prompt once, save to YAML) ---
+    exam_name = cfg.get("exam_name")
+    id_column_name = cfg.get("id_column_name")
+
+    if exam_name and id_column_name:
+        print(f"  {C.info('Exam name')}      : {C.bold(exam_name)}")
+        print(f"  {C.info('ID column name')} : {C.bold(id_column_name)}")
+    else:
+        if interactive:
+            if not exam_name:
+                try:
+                    exam_name = input(
+                        C.bold("  Enter exam name for the grade column ")
+                        + C.dim("(e.g. 'Partiel Mars 2026')")
+                        + C.bold(": ")
+                    ).strip()
+                except EOFError:
+                    exam_name = ""
+                if not exam_name:
+                    exam_name = "Grade"
+                    print(C.dim(f"  -> Using default: '{exam_name}'"))
+                cfg["exam_name"] = exam_name
+                config_changed = True
+
+            if not id_column_name:
+                try:
+                    id_column_name = input(
+                        C.bold("  Enter student ID column name for output ")
+                        + C.dim('(e.g. "Numéro d\'identification")')
+                        + C.bold(": ")
+                    ).strip()
+                except EOFError:
+                    id_column_name = ""
+                if not id_column_name:
+                    id_column_name = "Numéro d'identification"
+                    print(C.dim(f"  -> Using default: '{id_column_name}'"))
+                cfg["id_column_name"] = id_column_name
+                config_changed = True
+        else:
+            exam_name = exam_name or "Grade"
+            id_column_name = id_column_name or "Numéro d'identification"
+
+    print(C.info(f"\nReading master file: {master_path}"))
     master_df = read_file(master_path)
     master, master_warnings = build_master_index(master_df)
     if master_warnings:
-        print("Master file warnings:")
+        print(C.warn("Master file warnings:"))
         for w in master_warnings:
-            print(w)
+            print(C.warn(w))
 
-    # Resolve grade file list
     grade_file_paths = resolve_grade_files(
         config_dir,
         grade_files=cfg.get("grade_files"),
@@ -1402,17 +1476,14 @@ def consolidate(
     )
 
     if not grade_file_paths:
-        print("WARNING: No grade files found. Output will have no grades.")
+        print(C.warn("WARNING: No grade files found. Output will have no grades."))
 
-    # Load existing file overrides and name confirmations
     all_overrides: dict[str, dict] = cfg.get("column_overrides", {})
     all_name_confirmations: dict[str, list[str]] = cfg.get("name_confirmations", {})
-    config_changed = False
 
-    # Process TA files
     reports: list[FileReport] = []
     for gf_path in grade_file_paths:
-        print(f"Processing: {gf_path}")
+        print(C.info(f"\nProcessing: {gf_path}"))
         file_ov = all_overrides.get(gf_path.name, {})
         file_name_confs = all_name_confirmations.get(gf_path.name, [])
         report = process_ta_file(
@@ -1424,10 +1495,8 @@ def consolidate(
         )
         reports.append(report)
 
-        # Collect new file overrides from interactive choices
         if report.new_file_overrides:
             existing = all_overrides.get(gf_path.name, {})
-            # Deep merge: selected_sheets replaces, sheet_columns merges
             for key, val in report.new_file_overrides.items():
                 if key == "sheet_columns" and "sheet_columns" in existing:
                     for sn, sv in val.items():
@@ -1439,25 +1508,33 @@ def consolidate(
             all_overrides[gf_path.name] = existing
             config_changed = True
 
-        # Collect new name confirmations
         if report.new_name_confirmations:
             existing_confs = all_name_confirmations.get(gf_path.name, [])
             existing_confs.extend(report.new_name_confirmations)
             all_name_confirmations[gf_path.name] = existing_confs
             config_changed = True
 
-    # Persist overrides back to config if any new choices were made
     if config_changed:
         if all_overrides:
             cfg["column_overrides"] = all_overrides
         if all_name_confirmations:
             cfg["name_confirmations"] = all_name_confirmations
         save_config(config_path, cfg)
-        print(f"\n  Overrides saved to {config_path}")
+        print(C.ok(f"\n  Overrides saved to {config_path}"))
 
-    # Write output
-    write_moodle_csv(master, output_path)
-    print_summary(master, reports, str(output_path))
+    write_moodle_csv(
+        master,
+        output_path,
+        exam_name=exam_name,
+        id_column_name=id_column_name,
+    )
+    print_summary(
+        master,
+        reports,
+        str(output_path),
+        exam_name=exam_name,
+        id_column_name=id_column_name,
+    )
 
     return master, reports
 
@@ -1466,10 +1543,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Consolidate student grades into a Moodle-compatible CSV.",
     )
-    parser.add_argument(
-        "config",
-        help="Path to the YAML configuration file.",
-    )
+    parser.add_argument("config", help="Path to the YAML configuration file.")
     args = parser.parse_args()
     consolidate(args.config)
 

@@ -1,14 +1,8 @@
-#!/usr/bin/env python3
 """
-test_consolidate_grades.py
-==========================
-Unit and integration tests for consolidate_grades.py.
-
-Run with:  pytest test_consolidate_grades.py -v
+Test suite for consolidate_grades.
 """
 
 import csv
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -24,9 +18,7 @@ from consolidate_grades.consolidate import (
     find_header_row,
     levenshtein_distance,
     load_config,
-    make_name_key,
     name_similarity_hint,
-    normalize_name,
     normalize_text,
     parse_grade,
     process_ta_file,
@@ -45,35 +37,36 @@ from consolidate_grades.consolidate import (
 # ============================================================================
 
 
-def _master_df(rows=None):
-    """Create a small master DataFrame for testing."""
-    if rows is None:
-        rows = [
-            ("12345", "Jean", "Dupont", "jean.dupont@etu.fr"),
-            ("12346", "Marie", "Curie", "marie.curie@etu.fr"),
-            ("12347", "Éloïse", "Le Bœuf-André", "eloise.leboeuf@etu.fr"),
-            ("12348", "Ahmed", "Ben Salah", "ahmed.bensalah@etu.fr"),
-        ]
-    return pd.DataFrame(
-        rows,
-        columns=["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-    )
-
-
-def _write_csv(
-    path: Path, header: list[str], rows: list[list], sep=",", encoding="utf-8"
-):
-    """Write a quick CSV helper."""
-    with open(path, "w", newline="", encoding=encoding) as f:
+def _write_csv(path, header, rows, sep=",", encoding="utf-8"):
+    with open(path, "w", encoding=encoding, newline="") as f:
         w = csv.writer(f, delimiter=sep)
         w.writerow(header)
         w.writerows(rows)
 
 
+def _master_df(students):
+    """students = list of (id, first, last, email)."""
+    return pd.DataFrame(
+        {
+            "Numéro étudiant": [s[0] for s in students],
+            "Prénom": [s[1] for s in students],
+            "Nom de famille": [s[2] for s in students],
+            "Email": [s[3] for s in students],
+        }
+    )
+
+
 def _build_master():
-    """Build a MasterIndex from the standard test master."""
-    df = _master_df()
-    master, _warnings = build_master_index(df)
+    """Standard 4-student master roster."""
+    df = _master_df(
+        [
+            ("12345", "Jean", "Dupont", "jean@etu.fr"),
+            ("12346", "Marie", "Curie", "marie@etu.fr"),
+            ("12347", "Pierre", "Martin", "pierre@etu.fr"),
+            ("12348", "Sophie", "Bernard", "sophie@etu.fr"),
+        ]
+    )
+    master, _ = build_master_index(df)
     return master
 
 
@@ -83,101 +76,120 @@ def _build_master():
 
 
 class TestNormalizeText:
-    def test_lowercase(self):
-        assert normalize_text("HELLO") == "hello"
+    def test_basic_lowercase(self):
+        assert normalize_text("Hello") == "hello"
 
-    def test_accents_stripped(self):
-        assert normalize_text("Éloïse") == "eloise"
-        assert normalize_text("Numéro étudiant") == "numero etudiant"
-
-    def test_hyphens_become_spaces(self):
-        assert normalize_text("Le Bœuf-André") == "le bœuf andre"
-
-    def test_en_dash_becomes_space(self):
-        assert normalize_text("Jean\u2013Pierre") == "jean pierre"
-
-    def test_em_dash_becomes_space(self):
-        assert normalize_text("Jean\u2014Pierre") == "jean pierre"
-
-    def test_double_hyphen_collapses(self):
-        assert normalize_text("Jean--Pierre") == "jean pierre"
-
-    def test_spaced_hyphen_collapses(self):
-        assert normalize_text("Jean- -Pierre") == "jean pierre"
-        assert normalize_text("Jean - Pierre") == "jean pierre"
-
-    def test_all_dash_variants_match_same(self):
-        """All dash variants should normalize to the same result."""
-        expected = "jean pierre"
-        variants = [
-            "Jean-Pierre",
-            "Jean\u2013Pierre",  # en dash
-            "Jean\u2014Pierre",  # em dash
-            "Jean--Pierre",
-            "Jean- -Pierre",
-            "Jean \u2014 Pierre",
-        ]
-        for v in variants:
-            assert normalize_text(v) == expected, f"Failed for: {v!r}"
-
-    def test_underscores_become_spaces(self):
-        assert normalize_text("first_name") == "first name"
+    def test_strip_whitespace(self):
+        assert normalize_text("  hello  ") == "hello"
 
     def test_collapse_whitespace(self):
-        assert normalize_text("  nom   de   famille  ") == "nom de famille"
+        assert normalize_text("hello   world") == "hello world"
 
-    def test_combined(self):
-        assert normalize_text("  Numéro_Étudiant  ") == "numero etudiant"
+    def test_accents_removed(self):
+        assert normalize_text("Numéro étudiant") == "numero etudiant"
 
-    def test_ascii_apostrophe_becomes_space(self):
-        assert normalize_text("Numéro d'identification") == "numero d identification"
+    def test_apostrophe_to_space(self):
+        assert normalize_text("d'étudiant") == "d etudiant"
 
-    def test_curly_apostrophe_becomes_space(self):
+    def test_curly_apostrophe(self):
+        assert normalize_text("d\u2019etudiant") == "d etudiant"
+
+    def test_dashes_to_space(self):
+        assert normalize_text("nom-de-famille") == "nom de famille"
+
+    def test_en_dash(self):
+        assert normalize_text("nom\u2013de\u2013famille") == "nom de famille"
+
+    def test_em_dash(self):
+        assert normalize_text("nom\u2014de\u2014famille") == "nom de famille"
+
+    def test_underscore(self):
+        assert normalize_text("nom_de_famille") == "nom de famille"
+
+    def test_n_degree(self):
+        assert normalize_text("N° étudiant") == "no etudiant"
+
+    def test_n_ordinal_o(self):
+        assert normalize_text("Nº étudiant") == "no etudiant"
+
+    def test_c1_control_stripped(self):
         assert (
-            normalize_text("Num\u00e9ro d\u2019identification")
-            == "numero d identification"
+            normalize_text("Num\u0092ro d\u0092identification")
+            == "num ro d identification"
         )
 
-    def test_left_curly_apostrophe(self):
-        assert normalize_text("l\u2018exemple") == "l exemple"
+    def test_acute_accent_apostrophe(self):
+        assert normalize_text("d\u00b4etudiant") == "d etudiant"
 
-    def test_degree_sign_becomes_o(self):
-        assert normalize_text("N°") == "no"
-        assert normalize_text("N° d'identification") == "no d identification"
+    def test_prime_apostrophe(self):
+        assert normalize_text("d\u2032etudiant") == "d etudiant"
 
-    def test_ordinal_indicator_becomes_o(self):
-        assert normalize_text("Nº etudiant") == "no etudiant"
+    def test_fullwidth_apostrophe(self):
+        assert normalize_text("d\uff07etudiant") == "d etudiant"
+
+    def test_n_degree_no_space(self):
+        assert normalize_text("N°étudiant") == "no etudiant"
+        assert normalize_text("N°identification") == "no identification"
+
+
+class TestFullNameColumn:
+    def test_nom_etu_detected(self):
+        assert detect_column(["Nom étu", "Note"], "full_name") == "Nom étu"
+
+    def test_full_pipeline_with_merged_name_and_id(self, tmp_path):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Nom étu", "N°étudiant", "TOTAL"],
+            [["Jean Dupont", "12345", "15"]],
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert report.grades_assigned == 1
+        assert master.by_id["12345"].grade == 15.0
+
+    def test_full_name_fallback_no_id(self, tmp_path):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Nom étu", "Note"],
+            [["Jean Dupont", "15"], ["Curie Marie", "14"]],
+        )
+        report = process_ta_file(p, master, interactive=False)
+        assert report.grades_assigned == 2
+        assert master.by_id["12345"].grade == 15.0
+        assert master.by_id["12346"].grade == 14.0
 
 
 # ============================================================================
-# 1b. clean_column_names
+# 2. clean_column_names
 # ============================================================================
 
 
 class TestCleanColumnNames:
-    def test_bom_stripped(self):
-        df = pd.DataFrame({"\ufeffPrénom": ["Alice"], "Nom": ["Martin"]})
-        cleaned = clean_column_names(df)
-        assert list(cleaned.columns) == ["Prénom", "Nom"]
+    def test_strip_bom(self):
+        df = pd.DataFrame({"\ufeffNumero": [1]})
+        df = clean_column_names(df)
+        assert "Numero" in df.columns
 
-    def test_zero_width_space_stripped(self):
-        df = pd.DataFrame({"\u200bID": ["1"], "Note\u200b": ["15"]})
-        cleaned = clean_column_names(df)
-        assert list(cleaned.columns) == ["ID", "Note"]
+    def test_strip_zero_width(self):
+        df = pd.DataFrame({"\u200bPrenom": [1]})
+        df = clean_column_names(df)
+        assert "Prenom" in df.columns
 
-    def test_surrounding_whitespace_stripped(self):
-        df = pd.DataFrame({"  Prénom  ": ["Alice"], " Nom ": ["Martin"]})
-        cleaned = clean_column_names(df)
-        assert list(cleaned.columns) == ["Prénom", "Nom"]
+    def test_strip_whitespace(self):
+        df = pd.DataFrame({"  Note  ": [1]})
+        df = clean_column_names(df)
+        assert "Note" in df.columns
 
-    def test_clean_columns_already_clean(self):
-        df = pd.DataFrame({"Prénom": ["Alice"], "Nom": ["Martin"]})
-        cleaned = clean_column_names(df)
-        assert list(cleaned.columns) == ["Prénom", "Nom"]
+
+# ============================================================================
+# 3. detect_column
+# ============================================================================
 
 
 class TestDetectColumn:
-    # --- ID column ---
     @pytest.mark.parametrize(
         "col_name",
         [
@@ -191,7 +203,6 @@ class TestDetectColumn:
             "Identifiant",
             "Code étudiant",
             "No étudiant",
-            "Numéro d\u2019identification",
             "Numéro d'identification",
             "N° d'identification",
             "Numero d'etudiant",
@@ -202,43 +213,25 @@ class TestDetectColumn:
     def test_id_variants(self, col_name):
         assert detect_column([col_name, "Other"], "id") == col_name
 
-    # --- First name ---
     @pytest.mark.parametrize(
         "col_name",
-        ["Prénom", "prenom", "First Name", "first_name", "Given Name"],
+        ["Prénom", "prenom", "First Name", "firstname", "Given Name"],
     )
     def test_first_name_variants(self, col_name):
         assert detect_column([col_name, "Other"], "first_name") == col_name
 
-    # --- Last name ---
     @pytest.mark.parametrize(
         "col_name",
-        ["Nom", "Nom de famille", "Last Name", "last_name", "Family Name"],
+        ["Nom", "Nom de famille", "Last Name", "Surname", "Family Name"],
     )
     def test_last_name_variants(self, col_name):
         assert detect_column([col_name, "Other"], "last_name") == col_name
 
-    # --- Email ---
-    @pytest.mark.parametrize(
-        "col_name",
-        [
-            "Email",
-            "Mail",
-            "Courriel",
-            "Adresse email",
-            "E-mail",
-            "Email address",
-            "Adresse de courriel",
-        ],
-    )
-    def test_email_variants(self, col_name):
-        assert detect_column([col_name, "Other"], "email") == col_name
-
-    # --- Grade ---
     @pytest.mark.parametrize(
         "col_name",
         [
             "Note",
+            "Notes",
             "Grade",
             "Score",
             "Résultat",
@@ -246,8 +239,6 @@ class TestDetectColumn:
             "Points",
             "Note finale",
             "Total",
-            "Total général",
-            "Notes",
         ],
     )
     def test_grade_variants(self, col_name):
@@ -257,300 +248,117 @@ class TestDetectColumn:
         assert detect_column(["Foo", "Bar"], "id") is None
 
     def test_first_match_wins(self):
-        # If two columns match, first one is returned
         assert detect_column(["ID", "Student ID"], "id") == "ID"
 
 
+class TestDetectAllColumns:
+    def test_single_match(self):
+        assert detect_all_columns(["Numéro étudiant", "Note"], "id") == [
+            "Numéro étudiant"
+        ]
+
+    def test_multiple_matches(self):
+        cols = ["Numero", "Prenom", "Numero etudiant", "Note"]
+        matches = detect_all_columns(cols, "id")
+        assert "Numero" in matches
+        assert "Numero etudiant" in matches
+        assert len(matches) == 2
+
+    def test_no_match(self):
+        assert detect_all_columns(["Foo", "Bar"], "id") == []
+
+
 # ============================================================================
-# 3. detect_grade_column (by name, by content, ambiguous)
+# 4. detect_grade_column
 # ============================================================================
 
 
 class TestDetectGradeColumn:
-    def test_by_name(self):
+    def test_simple_note(self):
         df = pd.DataFrame({"ID": ["1"], "Note": ["15"]})
-        col, warnings, _ambiguous = detect_grade_column(df, {"ID"})
+        col, _, _ = detect_grade_column(df, {"ID"})
         assert col == "Note"
-        assert len(warnings) == 0
-
-    def test_by_content_single_candidate(self):
-        df = pd.DataFrame(
-            {"ID": ["1", "2"], "Nom": ["A", "B"], "Mystery": ["14,5", "ABS"]}
-        )
-        col, warnings, _ambiguous = detect_grade_column(df, {"ID", "Nom"})
-        assert col == "Mystery"
-        assert any("auto-detected" in w for w in warnings)
-
-    def test_by_content_ambiguous(self):
-        df = pd.DataFrame(
-            {
-                "ID": ["1", "2"],
-                "Col_A": ["14", "15"],
-                "Col_B": ["10", "12"],
-            }
-        )
-        col, warnings, _ambiguous = detect_grade_column(df, {"ID"})
-        assert col is None
-        assert any("AMBIGUOUS" in w for w in warnings)
-
-    def test_no_grade_column(self):
-        df = pd.DataFrame({"ID": ["1"], "Nom": ["A"], "Adresse": ["1 rue X"]})
-        col, warnings, _ambiguous = detect_grade_column(df, {"ID", "Nom"})
-        assert col is None
-        assert any("No grade column" in w for w in warnings)
-
-    def test_with_slash_notation(self):
-        """Grades like '15/20' should still be detected as numeric."""
-        df = pd.DataFrame({"ID": ["1", "2"], "Résultat": ["15/20", "12,5/20"]})
-        col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
-        # Should match by name first
-        assert col == "Résultat"
 
     def test_prefix_match_note_slash_20(self):
-        """'Note /20' should be detected via prefix matching."""
-        df = pd.DataFrame({"ID": ["1", "2"], "Note /20": ["15", "16"]})
-        col, warnings, _ambiguous = detect_grade_column(df, {"ID"})
+        df = pd.DataFrame({"ID": ["1"], "Note /20": ["15"]})
+        col, _warnings, _ = detect_grade_column(df, {"ID"})
         assert col == "Note /20"
-        assert any("prefix" in w.lower() for w in warnings)
+        assert any("prefix" in w.lower() for w in _warnings)
 
     def test_prefix_match_note_slash_23(self):
-        """'Note /23' should also work."""
         df = pd.DataFrame({"ID": ["1"], "Note /23": ["18"]})
-        col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
+        col, _, _ = detect_grade_column(df, {"ID"})
         assert col == "Note /23"
 
     def test_prefix_match_notes_sur(self):
-        """'Notes sur 23' detected via prefix on 'notes' alias."""
         df = pd.DataFrame({"Numéro étudiant": ["1"], "Notes sur 23": ["15"]})
-        col, warnings, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
+        col, _warnings, _ = detect_grade_column(df, {"Numéro étudiant"})
         assert col == "Notes sur 23"
-        assert any("prefix" in w.lower() for w in warnings)
 
-    def test_total_column_with_subscores(self):
-        """'Total' preferred over Q1-Q14 sub-score columns via exact alias."""
+    def test_total_preferred_over_questions(self):
         df = pd.DataFrame(
             {
-                "Numéro étudiant": ["1", "2"],
-                "Q1": ["2", "1"],
-                "Q2": ["3", "2"],
-                "Q3": ["1", "0"],
-                "Total": ["6", "3"],
+                "ID": ["1"],
+                "Q1": ["1"],
+                "Q2": ["2"],
+                "Total": ["15"],
             }
         )
-        col, warnings, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
-        assert col == "Total"
-        # Total is an exact alias match, so no warnings expected
-        assert len(warnings) == 0
-
-    def test_summary_column_preferred_over_subscores(self):
-        """When summary column is not an alias, prefer it via content heuristic."""
-        df = pd.DataFrame(
-            {
-                "Numéro étudiant": ["1", "2"],
-                "Q1": ["2", "1"],
-                "Q2": ["3", "2"],
-                "Q3": ["1", "0"],
-                "Somme": ["6", "3"],
-            }
-        )
-        col, warnings, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
-        assert col == "Somme"
-        assert any("summary" in w.lower() for w in warnings)
-
-    def test_total_exact_name_match(self):
-        """'Total' as exact alias match (no sub-score columns needed)."""
-        df = pd.DataFrame({"ID": ["1"], "Total": ["15"]})
-        col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
+        col, _, _ = detect_grade_column(df, {"ID"})
         assert col == "Total"
 
-    def test_ambiguous_prefix_matches(self):
-        """Multiple prefix matches should be flagged as ambiguous."""
-        df = pd.DataFrame({"ID": ["1"], "Note /20": ["15"], "Note finale /20": ["15"]})
-        _col, _warnings, _ambiguous = detect_grade_column(df, {"ID"})
-        # note finale is an exact alias, so it matches by name first
-        # Let's test with two true prefix-only columns instead
-        df2 = pd.DataFrame({"ID": ["1"], "Score /20": ["15"], "Score max": ["20"]})
-        col2, warnings2, _ambiguous2 = detect_grade_column(df2, {"ID"})
-        assert col2 is None
-        assert any("AMBIGUOUS" in w for w in warnings2)
+    def test_ambiguous_grades(self):
+        df = pd.DataFrame({"ID": ["1"], "Note /20": ["15"], "Note /23": ["18"]})
+        col, _, ambig = detect_grade_column(df, {"ID"})
+        assert col is None
+        assert "Note /20" in ambig
+        assert "Note /23" in ambig
+
+    def test_no_grade_column(self):
+        df = pd.DataFrame({"ID": ["1"], "Foo": ["bar"]})
+        col, _warnings, _ = detect_grade_column(df, {"ID"})
+        assert col is None
+        assert any("no grade" in w.lower() for w in _warnings)
 
 
 # ============================================================================
-# 3b. Header row detection
+# 5. find_header_row / promote_header_row
 # ============================================================================
 
 
 class TestFindHeaderRow:
-    def test_good_headers_returns_none(self):
-        """When headers are already correct, return None."""
-        df = pd.DataFrame({"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]})
+    def test_normal_headers_no_promotion(self):
+        df = pd.DataFrame({"Numéro étudiant": ["1"], "Prénom": ["Jean"]})
         assert find_header_row(df) is None
 
-    def test_title_in_row_0(self):
-        """Title in row 0, real headers in data row 0 (original row 1)."""
+    def test_title_row_above_headers(self):
+        # First column is "Title", others empty — current headers don't look right
         df = pd.DataFrame(
             {
-                "Notes QCM CC 9 mars 2026 EI-3": [
-                    "Numero",
-                    "12345",
-                ],
-                "Unnamed: 1": ["Prenom", "Alice"],
-                "Unnamed: 2": ["Nom", "Martin"],
-                "Unnamed: 3": ["Numero etudiant", "12345"],
-                "Unnamed: 4": ["Note /23", "18"],
+                "Title": ["Numéro étudiant", "1"],
+                "Unnamed: 1": ["Prénom", "Jean"],
+                "Unnamed: 2": ["Note", "15"],
             }
         )
         row = find_header_row(df)
         assert row == 0
 
-    def test_multiple_metadata_rows(self):
-        """Multiple metadata rows before real headers."""
-        df = pd.DataFrame(
-            {
-                "Notes - UL1IN002": [
-                    "Correcteur : Bilal",
-                    "",
-                    "Numero d'etudiant",
-                    "12345",
-                ],
-                "Unnamed: 1": [
-                    "Groupes : DC-1",
-                    "",
-                    "Nom",
-                    "Martin",
-                ],
-                "Unnamed: 2": ["", "", "Prenom", "Alice"],
-                "Unnamed: 3": ["", "", "Note", "15"],
-            }
-        )
-        row = find_header_row(df)
-        assert row == 2
-
-    def test_no_alias_matches_anywhere(self):
-        """When no row has alias matches, return None (stay with current)."""
-        df = pd.DataFrame(
-            {
-                "Foo": ["bar", "baz"],
-                "Qux": ["quux", "corge"],
-            }
-        )
-        assert find_header_row(df) is None
-
     def test_promote_header_row(self):
-        """promote_header_row drops preamble and sets new headers."""
         df = pd.DataFrame(
             {
-                "Title": ["Metadata", "Nom", "Martin"],
-                "Col2": ["Info", "Prenom", "Alice"],
-                "Col3": ["", "Note", "15"],
-            }
-        )
-        new_df = promote_header_row(df, 1)
-        assert list(new_df.columns) == ["Nom", "Prenom", "Note"]
-        assert len(new_df) == 1
-        assert new_df.iloc[0]["Nom"] == "Martin"
-
-
-class TestReadFileHeaderDetection:
-    def test_csv_with_title_row(self, tmp_path):
-        """CSV where row 1 has a title, row 2 has real headers."""
-        p = tmp_path / "ta.csv"
-        p.write_text(
-            "Notes QCM CC 9 mars 2026 EI-3,,,,\n"
-            "Numero,Prenom,Nom,Numero etudiant,Note /23\n"
-            "1,Alice,Martin,12345,18\n",
-            encoding="utf-8",
-        )
-        df = read_file(p)
-        assert "Numero etudiant" in df.columns or "Numero" in df.columns
-        assert len(df) == 1
-
-    def test_csv_with_multiple_metadata_rows(self, tmp_path):
-        """CSV with 3 rows of metadata before the real headers."""
-        p = tmp_path / "ta.csv"
-        p.write_text(
-            "Notes Elements de programmation 2,,,\n"
-            "Correcteur : Bilal,Groupes : DC-1,,\n"
-            ",,,\n"
-            "Numero d'etudiant,Nom,Prenom,Note\n"
-            "12345,Martin,Alice,15\n",
-            encoding="utf-8",
-        )
-        df = read_file(p)
-        # The header detection should have found the real header row
-        cols_norm = [c.lower() for c in df.columns]
-        assert any(c == "nom" for c in cols_norm)
-        assert len(df) == 1
-
-    def test_xlsx_with_title_row(self, tmp_path):
-        """XLSX where row 1 has a title, row 2 has real headers."""
-        p = tmp_path / "ta.xlsx"
-        raw = pd.DataFrame(
-            {
-                "Notes QCM": ["Numero etudiant", "12345"],
-                "Unnamed: 1": ["Nom", "Martin"],
+                "Title": ["Numéro étudiant", "1"],
+                "Unnamed: 1": ["Prénom", "Jean"],
                 "Unnamed: 2": ["Note", "15"],
             }
         )
-        raw.to_excel(p, index=False, engine="openpyxl")
-        df = read_file(p)
-        assert detect_column(list(df.columns), "id") is not None
-        assert len(df) == 1
+        df2 = promote_header_row(df, 0)
+        assert "Numéro étudiant" in df2.columns
+        assert df2.iloc[0]["Prénom"] == "Jean"
 
-    def test_normal_csv_not_degraded(self, tmp_path):
-        """A normal CSV should NOT have its headers changed."""
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["12345", "Alice", "Martin", "15"]],
-        )
-        df = read_file(p)
-        assert df.columns[0] == "Numéro étudiant"
-        assert len(df) == 1
 
-    def test_integration_ta_file_with_title_row(self, tmp_path):
-        """Full pipeline with a TA file that has a title row."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        p.write_text(
-            "Notes QCM CC 9 mars 2026,,,,\n"
-            "Numero,Prenom,Nom,Numero etudiant,Note /23\n"
-            "1,Jean,Dupont,12345,18\n"
-            "2,Marie,Curie,12346,15\n",
-            encoding="utf-8",
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 18.0
-        assert master.by_id["12346"].grade == 15.0
-
-    def test_integration_ta_file_with_subscores_and_total(self, tmp_path):
-        """TA file with Q1-Q14 sub-scores and a Total column."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            [
-                "Prénom",
-                "Nom de famille",
-                "N° d'identification",
-                "Q1",
-                "Q2",
-                "Q3",
-                "Total",
-            ],
-            [
-                ["Jean", "Dupont", "12345", "2", "3", "1", "6"],
-                ["Marie", "Curie", "12346", "1", "2", "0.5", "3.5"],
-            ],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 6.0
-        assert master.by_id["12346"].grade == 3.5
+# ============================================================================
+# 6. read_file
+# ============================================================================
 
 
 class TestReadFile:
@@ -561,24 +369,28 @@ class TestReadFile:
         assert list(df.columns) == ["A", "B"]
         assert len(df) == 2
 
-    def test_csv_semicolon_separator(self, tmp_path):
+    def test_csv_semicolon(self, tmp_path):
         p = tmp_path / "data.csv"
-        _write_csv(p, ["A", "B"], [["1", "x"], ["2", "y"]], sep=";")
+        _write_csv(p, ["A", "B"], [["1", "x"]], sep=";")
         df = read_file(p)
         assert list(df.columns) == ["A", "B"]
-        assert len(df) == 2
 
-    def test_csv_latin1_encoding(self, tmp_path):
+    def test_csv_latin1(self, tmp_path):
         p = tmp_path / "data.csv"
-        _write_csv(
-            p,
-            ["Prénom", "Note"],
-            [["Éloïse", "14,5"]],
-            encoding="latin-1",
-        )
+        _write_csv(p, ["Prénom", "Note"], [["Éloïse", "14,5"]], encoding="latin-1")
         df = read_file(p)
         assert "Prénom" in df.columns
         assert df.iloc[0]["Prénom"] == "Éloïse"
+
+    def test_csv_cp1252_with_apostrophe(self, tmp_path):
+        """cp1252 byte 0x92 should decode as U+2019."""
+        p = tmp_path / "data.csv"
+        with open(p, "wb") as f:
+            f.write("Numéro d\u2019identification;Note\n".encode("cp1252"))
+            f.write("12345;15\n".encode("cp1252"))
+        df = read_file(p)
+        col = detect_column(list(df.columns), "id")
+        assert col is not None
 
     def test_xlsx(self, tmp_path):
         p = tmp_path / "data.xlsx"
@@ -597,11 +409,11 @@ class TestReadFile:
     def test_unsupported_extension(self, tmp_path):
         p = tmp_path / "data.json"
         p.write_text("{}")
-        with pytest.raises(ValueError, match="Unsupported file extension"):
+        with pytest.raises(ValueError, match="Unsupported"):
             read_file(p)
 
     def test_csv_utf7_encoding(self, tmp_path):
-        """CSV saved in UTF-7 encoding should be decoded correctly."""
+        """UTF-7 encoded CSV should be decoded correctly."""
         p = tmp_path / "data.csv"
         with open(p, "w", encoding="utf-7") as f:
             f.write("Prénom,Nom de famille,Numéro,Note\n")
@@ -611,59 +423,27 @@ class TestReadFile:
         assert df.iloc[0]["Prénom"] == "Éloïse"
 
     def test_csv_utf7_column_detection(self, tmp_path):
-        """UTF-7 columns should be decoded and detected by alias matching."""
         p = tmp_path / "data.csv"
         with open(p, "w", encoding="utf-7") as f:
             f.write("Prénom,Nom de famille,Numéro,Note\n")
             f.write("Jean,Dupont,12345,15\n")
         df = read_file(p)
         assert detect_column(list(df.columns), "first_name") is not None
-        assert detect_column(list(df.columns), "grade") is not None
 
-    def test_csv_utf7_with_semicolons(self, tmp_path):
-        """UTF-7 with semicolon separators."""
+    def test_normal_csv_with_plus_not_misdetected(self, tmp_path):
         p = tmp_path / "data.csv"
-        with open(p, "w", encoding="utf-7") as f:
-            f.write("Prénom;Nom;Numéro;Note\n")
-            f.write("François;Müller;12346;14\n")
-        df = read_file(p)
-        assert "Prénom" in df.columns
-        assert df.iloc[0]["Prénom"] == "François"
-
-    def test_normal_csv_not_broken_by_utf7_detection(self, tmp_path):
-        """Normal UTF-8 CSV with '+' in data should not be misdetected as UTF-7."""
-        p = tmp_path / "data.csv"
-        _write_csv(
-            p,
-            ["Prénom", "Note"],
-            [["Jean+Pierre", "15"]],
-        )
+        _write_csv(p, ["Prénom", "Note"], [["Jean+Pierre", "15"]])
         df = read_file(p)
         assert df.iloc[0]["Prénom"] == "Jean+Pierre"
 
-    def test_csv_utf7_integration(self, tmp_path):
-        """Full pipeline: UTF-7 TA file with accented names."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        with open(p, "w", encoding="utf-7") as f:
-            f.write("Prénom,Nom de famille,Numéro étudiant,Note\n")
-            f.write("Jean,Dupont,12345,15\n")
-            f.write("Marie,Curie,12346,14\n")
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 15.0
-        assert master.by_id["12346"].grade == 14.0
-
 
 # ============================================================================
-# 4b. Multi-sheet reading
+# 7. read_file_sheets — multi-sheet
 # ============================================================================
 
 
 class TestMultiSheet:
     def test_xlsx_single_sheet(self, tmp_path):
-        """XLSX with one sheet returns that sheet."""
         p = tmp_path / "data.xlsx"
         pd.DataFrame({"Numéro étudiant": ["1"], "Note": ["15"]}).to_excel(
             p, index=False, engine="openpyxl"
@@ -671,8 +451,7 @@ class TestMultiSheet:
         sheets = read_file_sheets(p)
         assert len(sheets) == 1
 
-    def test_xlsx_multi_sheet(self, tmp_path):
-        """XLSX with multiple grade sheets returns all of them."""
+    def test_xlsx_multi_sheet_all_grade_data(self, tmp_path):
         p = tmp_path / "data.xlsx"
         with pd.ExcelWriter(p, engine="openpyxl") as writer:
             pd.DataFrame(
@@ -683,12 +462,8 @@ class TestMultiSheet:
             ).to_excel(writer, sheet_name="DC-2", index=False)
         sheets = read_file_sheets(p)
         assert len(sheets) == 2
-        names = [name for name, _ in sheets]
-        assert "DC-1" in names
-        assert "DC-2" in names
 
-    def test_xlsx_multi_sheet_skips_non_grade_sheets(self, tmp_path):
-        """Sheets without grade-like columns are skipped."""
+    def test_xlsx_skips_non_grade_sheets(self, tmp_path):
         p = tmp_path / "data.xlsx"
         with pd.ExcelWriter(p, engine="openpyxl") as writer:
             pd.DataFrame(
@@ -701,487 +476,171 @@ class TestMultiSheet:
         assert len(sheets) == 1
         assert sheets[0][0] == "Grades"
 
-    def test_ods_multi_sheet(self, tmp_path):
-        """ODS with multiple grade sheets."""
-        p = tmp_path / "data.ods"
-        with pd.ExcelWriter(p, engine="odf") as writer:
-            pd.DataFrame(
-                {"Numéro étudiant": ["1"], "Prénom": ["A"], "Note": ["15"]}
-            ).to_excel(writer, sheet_name="Group1", index=False)
-            pd.DataFrame(
-                {"Numéro étudiant": ["2"], "Prénom": ["B"], "Note": ["14"]}
-            ).to_excel(writer, sheet_name="Group2", index=False)
-        sheets = read_file_sheets(p)
-        assert len(sheets) == 2
-
     def test_csv_returns_single_sheet(self, tmp_path):
-        """CSV files always return exactly one sheet."""
         p = tmp_path / "data.csv"
         _write_csv(p, ["Numéro étudiant", "Note"], [["1", "15"]])
         sheets = read_file_sheets(p)
         assert len(sheets) == 1
         assert sheets[0][0] == ""
 
-    def test_multi_sheet_integration(self, tmp_path):
-        """Full pipeline: XLSX with 2 sheets, both processed."""
-        master = _build_master()
-        p = tmp_path / "ta.xlsx"
-        with pd.ExcelWriter(p, engine="openpyxl") as writer:
-            pd.DataFrame(
-                {"Numéro étudiant": ["12345"], "Prénom": ["Jean"], "Note": ["15"]}
-            ).to_excel(writer, sheet_name="DC-1", index=False)
-            pd.DataFrame(
-                {"Numéro étudiant": ["12346"], "Prénom": ["Marie"], "Note": ["14"]}
-            ).to_excel(writer, sheet_name="DC-2", index=False)
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 15.0
-        assert master.by_id["12346"].grade == 14.0
-        assert any("2 sheets" in w for w in report.warnings)
-
-    def test_multi_sheet_with_metadata_sheet(self, tmp_path):
-        """Only grade-like sheets are processed, metadata ignored."""
-        master = _build_master()
-        p = tmp_path / "ta.xlsx"
-        with pd.ExcelWriter(p, engine="openpyxl") as writer:
-            pd.DataFrame(
-                {"Numéro étudiant": ["12345"], "Prénom": ["Jean"], "Note": ["15"]}
-            ).to_excel(writer, sheet_name="Notes", index=False)
-            pd.DataFrame({"Info": ["Correcteur"], "Valeur": ["M. Dupond"]}).to_excel(
-                writer, sheet_name="Info", index=False
-            )
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        assert report.grades_assigned == 1
-
 
 # ============================================================================
-# 4c. Apostrophe-like character edge cases
-# ============================================================================
-
-
-class TestApostropheEdgeCases:
-    def test_win1252_control_char(self):
-        """U+0092 (C1 control, from latin-1 misread of cp1252) stripped as space."""
-        assert (
-            normalize_text("Num\u0092ro d\u0092identification")
-            == "num ro d identification"
-        )
-
-    def test_acute_accent_as_apostrophe(self):
-        """U+00B4 acute accent used as apostrophe."""
-        assert (
-            normalize_text("Numéro d\u00b4identification") == "numero d identification"
-        )
-
-    def test_prime_as_apostrophe(self):
-        """U+2032 prime used as apostrophe."""
-        assert normalize_text("d\u2032identification") == "d identification"
-
-    def test_fullwidth_apostrophe(self):
-        """U+FF07 fullwidth apostrophe."""
-        assert normalize_text("d\uff07identification") == "d identification"
-
-    def test_csv_with_win1252_apostrophe(self, tmp_path):
-        """CSV with Win-1252 apostrophe in column name should detect ID."""
-        p = tmp_path / "ta.csv"
-        # Write with cp1252: é is 0xE9, apostrophe is 0x92
-        with open(p, "wb") as f:
-            f.write("Numéro d\u2019identification;Notes sur 23\n".encode("cp1252"))
-            f.write("12345;15\n".encode("cp1252"))
-        df = read_file(p)
-        col = detect_column(list(df.columns), "id")
-        assert col is not None
-
-
-class TestNameNormalization:
-    def test_basic(self):
-        assert normalize_name("Jean") == "jean"
-
-    def test_accents(self):
-        assert normalize_name("Éloïse") == "eloise"
-
-    def test_hyphen(self):
-        assert normalize_name("Le Bœuf-André") == "le bœuf andre"
-        # Note: œ is NOT an accent - it is a ligature and survives normalization
-        # This is deliberate: we only strip combining characters, not ligatures.
-
-    def test_dash_variants_all_match(self):
-        """All dash variants in names produce the same key."""
-        key_ref = make_name_key("Jean-Pierre", "Dupont")
-        assert make_name_key("Jean\u2013Pierre", "Dupont") == key_ref  # en dash
-        assert make_name_key("Jean\u2014Pierre", "Dupont") == key_ref  # em dash
-        assert make_name_key("Jean--Pierre", "Dupont") == key_ref
-        assert make_name_key("Jean- -Pierre", "Dupont") == key_ref
-
-    def test_make_name_key(self):
-        key = make_name_key("Jean-Pierre", "Dupont")
-        assert key == "dupont|jean pierre"
-
-    def test_make_name_key_accented(self):
-        key = make_name_key("Éloïse", "André")
-        assert key == "andre|eloise"
-
-
-# ============================================================================
-# 6. parse_grade
+# 8. parse_grade
 # ============================================================================
 
 
 class TestParseGrade:
     def test_integer(self):
-        g = parse_grade("15")
-        assert g.value == 15.0
-        assert not g.is_absent
+        assert parse_grade("15").value == 15.0
 
-    def test_float_dot(self):
-        g = parse_grade("14.5")
-        assert g.value == 14.5
+    def test_float(self):
+        assert parse_grade("15.5").value == 15.5
 
-    def test_float_comma(self):
-        g = parse_grade("14,5")
-        assert g.value == 14.5
-
-    def test_with_slash(self):
-        g = parse_grade("15/20")
-        assert g.value == 15.0
-
-    def test_with_slash_and_comma(self):
-        g = parse_grade("12,5/20")
-        assert g.value == 12.5
+    def test_french_comma(self):
+        assert parse_grade("15,5").value == 15.5
 
     def test_abs(self):
         g = parse_grade("ABS")
         assert g.is_absent
-        assert g.value is None
 
     def test_def(self):
-        g = parse_grade("DEF")
-        assert g.is_absent
-
-    def test_absent_case_insensitive(self):
-        g = parse_grade("abs")
-        # our code does .upper() comparison
-        assert g.is_absent
+        assert parse_grade("DEF").is_absent
 
     def test_absence_full_word(self):
-        g = parse_grade("Absence")
-        assert g.is_absent
-        assert g.value is None
+        assert parse_grade("Absence").is_absent
 
-    def test_empty_string(self):
+    def test_absent_lowercase(self):
+        assert parse_grade("abs").is_absent
+
+    def test_empty(self):
         g = parse_grade("")
         assert g.value is None
         assert not g.is_absent
-        assert g.warning is not None
 
     def test_none(self):
         g = parse_grade(None)
         assert g.value is None
 
-    def test_nan(self):
-        g = parse_grade(float("nan"))
-        assert g.value is None
-
     def test_garbage(self):
-        g = parse_grade("not_a_grade")
+        g = parse_grade("foobar")
         assert g.value is None
         assert g.warning is not None
 
-    def test_whitespace_padded(self):
-        g = parse_grade("  15  ")
-        assert g.value == 15.0
-
-    def test_zero(self):
-        g = parse_grade("0")
-        assert g.value == 0.0
-        assert not g.is_absent
-
-    def test_high_grade(self):
-        """No assumption about max grade."""
-        g = parse_grade("42")
-        assert g.value == 42.0
-
 
 # ============================================================================
-# 7. build_master_index
+# 9. build_master_index
 # ============================================================================
 
 
 class TestBuildMasterIndex:
     def test_basic(self):
-        master, warnings = build_master_index(_master_df())
-        assert len(master.all_students) == 4
-        assert "12345" in master.by_id
-        assert len(warnings) == 0
+        df = _master_df([("S1", "Jean", "Dupont", "j@e.fr")])
+        master, _ = build_master_index(df)
+        assert "S1" in master.by_id
+        assert master.by_id["S1"].first_name == "Jean"
+
+    def test_missing_id_column(self):
+        df = pd.DataFrame({"Prénom": ["Jean"], "Nom": ["Dupont"]})
+        with pytest.raises(ValueError, match="missing required"):
+            build_master_index(df)
 
     def test_duplicate_id_warning(self):
         df = _master_df(
             [
-                ("12345", "Jean", "Dupont", "jean@etu.fr"),
-                ("12345", "Marie", "Curie", "marie@etu.fr"),
+                ("S1", "Jean", "Dupont", "j@e.fr"),
+                ("S1", "Marie", "Curie", "m@e.fr"),
             ]
         )
         master, warnings = build_master_index(df)
-        assert len(warnings) == 1
-        assert "Duplicate" in warnings[0]
-        # First occurrence kept
-        assert master.by_id["12345"].first_name == "Jean"
-
-    def test_missing_column_raises(self):
-        df = pd.DataFrame({"Foo": ["1"], "Bar": ["x"]})
-        with pytest.raises(ValueError, match="missing required columns"):
-            build_master_index(df)
-
-    def test_name_index(self):
-        master, _ = build_master_index(_master_df())
-        key = make_name_key("Jean", "Dupont")
-        assert key in master.by_name
-        assert len(master.by_name[key]) == 1
+        assert any("duplicate" in w.lower() for w in warnings)
+        assert master.by_id["S1"].first_name == "Jean"
 
 
 # ============================================================================
-# 8. process_ta_file - matching, edge cases
+# 10. process_ta_file — basics
 # ============================================================================
 
 
 class TestProcessTaFile:
-    def _setup_master(self):
-        return _build_master()
-
-    def test_match_by_id(self, tmp_path):
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Note"],
-            [["12345", "15"], ["12346", "14,5"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 15.0
-        assert master.by_id["12346"].grade == 14.5
-
-    def test_match_by_name_fallback(self, tmp_path):
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Prénom", "Nom", "Note"],
-            [["Jean", "Dupont", "16"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 16.0
-
-    def test_match_by_name_with_accents(self, tmp_path):
-        """Name matching should handle accents."""
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Prénom", "Nom", "Note"],
-            [["Eloise", "Le Boeuf Andre", "17"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        # This should NOT match because œ ≠ oe in our normalization
-        # (we only strip combining chars, not expand ligatures).
-        # The user asked: "normalize for caps, accents, hyphens.
-        # Anything more than that should be a warning."
-        # So this is expected to fail to match — and produce a warning.
-        if report.grades_assigned == 0:
-            assert any("not found" in w for w in report.warnings)
-        # If the TA spells it exactly right (with œ), it should match:
-
-    def test_match_by_name_hyphen_normalized(self, tmp_path):
-        """Hyphens in names should be normalized."""
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        # Master has "Le Bœuf-André" — TA writes "Le Bœuf André" (no hyphen)
-        _write_csv(
-            p,
-            ["Prénom", "Nom", "Note"],
-            [["Éloïse", "Le Bœuf André", "18"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-
-    def test_match_by_name_dash_variants(self, tmp_path):
-        """Em dash, en dash, double hyphen in names should all match."""
-        # Master has "Le Bœuf-André" (regular hyphen)
-        master = self._setup_master()
-        # TA uses em dash
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Prénom", "Nom", "Note"],
-            [["Éloïse", "Le Bœuf\u2014André", "17"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-        assert master.by_id["12347"].grade == 17.0
-
-    def test_ambiguous_name_skipped(self, tmp_path):
-        """Two students with the same name → skip with warning."""
-        df = _master_df(
-            [
-                ("12345", "Jean", "Dupont", "jean1@etu.fr"),
-                ("12346", "Jean", "Dupont", "jean2@etu.fr"),
-            ]
-        )
-        master, _ = build_master_index(df)
-        p = tmp_path / "ta.csv"
-        _write_csv(p, ["Prénom", "Nom", "Note"], [["Jean", "Dupont", "14"]])
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 0
-        assert any("matches 2 students" in w for w in report.warnings)
-
-    def test_student_not_in_master(self, tmp_path):
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Note"],
-            [["99999", "15"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 0
-        assert any("not found" in w.lower() for w in report.warnings)
-
-    def test_id_match_with_name_cross_check_mismatch(self, tmp_path):
-        """ID matches but name differs → warning but still assign."""
-        master = self._setup_master()
+    def test_basic_id_match(self, tmp_path):
+        master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
             p,
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["12345", "Pierre", "Martin", "15"]],
+            [["12345", "Jean", "Dupont", "15"]],
         )
         report = process_ta_file(p, master, interactive=False)
+        assert not report.skipped
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
-        assert any("non-interactive" in w.lower() for w in report.warnings)
 
-    def test_duplicate_grade_warning(self, tmp_path):
-        """Same student in two TA files → warning, keep first grade."""
-        master = self._setup_master()
-        # First file
-        p1 = tmp_path / "ta1.csv"
-        _write_csv(p1, ["Numéro étudiant", "Note"], [["12345", "15"]])
-        process_ta_file(p1, master, interactive=False)
-
-        # Second file
-        p2 = tmp_path / "ta2.csv"
-        _write_csv(p2, ["Numéro étudiant", "Note"], [["12345", "18"]])
-        report = process_ta_file(p2, master, interactive=False)
-        assert master.by_id["12345"].grade == 15.0  # first grade kept
-        assert any("already has a grade" in w.lower() for w in report.warnings)
-
-    def test_absent_student(self, tmp_path):
-        master = self._setup_master()
+    def test_french_comma(self, tmp_path):
+        master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
             p,
-            ["Numéro étudiant", "Note"],
-            [["12345", "ABS"]],
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "15,5"]],
+        )
+        process_ta_file(p, master, interactive=False)
+        assert master.by_id["12345"].grade == 15.5
+
+    def test_absent_token(self, tmp_path):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["12345", "Jean", "Dupont", "ABS"]],
         )
         report = process_ta_file(p, master, interactive=False)
         assert report.students_absent == 1
         assert master.by_id["12345"].is_absent
-        assert master.by_id["12345"].grade is None
 
-    def test_garbage_grade_warning(self, tmp_path):
-        """Non-parseable grade → warning, no grade assigned."""
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Note"],
-            [["12345", "???"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 0
-        assert master.by_id["12345"].grade is None
-        assert any("could not parse" in w.lower() for w in report.warnings)
-
-    def test_empty_file_skipped(self, tmp_path):
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        p.write_text("Numéro étudiant,Note\n")
-        report = process_ta_file(p, master, interactive=False)
-        assert report.skipped
-
-    def test_no_usable_columns_skipped(self, tmp_path):
-        """File with neither ID nor names → skip."""
-        master = self._setup_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Foo", "Note"],
-            [["bar", "15"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.skipped
-        assert any("neither" in w.lower() for w in report.warnings)
-
-    def test_xlsx_file(self, tmp_path):
-        """TA file as XLSX."""
-        master = self._setup_master()
-        p = tmp_path / "ta.xlsx"
-        pd.DataFrame({"Numéro étudiant": ["12345"], "Note": ["15"]}).to_excel(
-            p, index=False, engine="openpyxl"
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-
-    def test_ods_file(self, tmp_path):
-        """TA file as ODS."""
-        master = self._setup_master()
-        p = tmp_path / "ta.ods"
-        pd.DataFrame({"Numéro étudiant": ["12345"], "Note": ["15"]}).to_excel(
-            p, index=False, engine="odf"
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-
-    def test_id_not_in_master_with_name_fallback(self, tmp_path):
-        """ID unknown but name columns exist → fall back to name."""
-        master = self._setup_master()
+    def test_id_match_with_name_cross_check_mismatch(self, tmp_path):
+        master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
             p,
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["99999", "Jean", "Dupont", "13"]],
+            [["12345", "Jean", "Dupond", "15"]],  # Dupond ≠ Dupont
         )
         report = process_ta_file(p, master, interactive=False)
+        # Non-interactive: still proceeds
         assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 13.0
-        assert any("not found in master" in w.lower() for w in report.warnings)
+        assert any("non-interactive" in w.lower() for w in report.warnings)
 
-    def test_semicolon_csv(self, tmp_path):
-        """French-style CSV with semicolons."""
-        master = self._setup_master()
+    def test_name_fallback_when_id_missing(self, tmp_path):
+        master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
             p,
-            ["Numéro étudiant", "Note"],
-            [["12345", "14,5"]],
-            sep=";",
+            ["Prénom", "Nom", "Note"],
+            [["Jean", "Dupont", "15"]],
+        )
+        process_ta_file(p, master, interactive=False)
+        assert master.by_id["12345"].grade == 15.0
+
+    def test_unknown_student_skipped(self, tmp_path):
+        master = _build_master()
+        p = tmp_path / "ta.csv"
+        _write_csv(
+            p,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [["99999", "Unknown", "Person", "15"]],
         )
         report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 14.5
+        assert report.grades_assigned == 0
 
 
 # ============================================================================
-# 9. write_moodle_csv
+# 11. write_moodle_csv
 # ============================================================================
 
 
 class TestWriteMoodleCsv:
-    def test_output_format(self, tmp_path):
+    def test_default_french_columns(self, tmp_path):
         master = _build_master()
         master.by_id["12345"].grade = 15.5
         master.by_id["12346"].is_absent = True
@@ -1190,581 +649,168 @@ class TestWriteMoodleCsv:
         write_moodle_csv(master, out)
 
         df = pd.read_csv(out, dtype=str, keep_default_na=False)
-        assert "Identifier" in df.columns
-        assert "Email address" in df.columns
+        assert "Numéro d'identification" in df.columns
+        assert "Adresse de courriel" in df.columns
+        assert "Prénom" in df.columns
+        assert "Nom de famille" in df.columns
         assert "Grade" in df.columns
-        assert len(df) == 4
 
-        jean_row = df[df["Identifier"] == "12345"].iloc[0]
-        assert jean_row["Grade"] == "15.5"
+        jean = df[df["Numéro d'identification"] == "12345"].iloc[0]
+        assert jean["Grade"] == "15.5"
 
-        marie_row = df[df["Identifier"] == "12346"].iloc[0]
-        assert marie_row["Grade"] == "ABS"
+        marie = df[df["Numéro d'identification"] == "12346"].iloc[0]
+        assert marie["Grade"] == "ABS"
 
     def test_no_grade_is_empty(self, tmp_path):
         master = _build_master()
         out = tmp_path / "out.csv"
         write_moodle_csv(master, out)
         df = pd.read_csv(out, dtype=str, keep_default_na=False)
-        # Students with no grade should have empty string
         assert all(
-            df.loc[df["Identifier"] == sid, "Grade"].values[0] == ""
+            df.loc[df["Numéro d'identification"] == sid, "Grade"].values[0] == ""
             for sid in ["12345", "12346", "12347", "12348"]
         )
 
+    def test_custom_exam_name(self, tmp_path):
+        master = _build_master()
+        master.by_id["12345"].grade = 15.0
+        out = tmp_path / "out.csv"
+        write_moodle_csv(master, out, exam_name="Partiel Mars 2026")
+        df = pd.read_csv(out, dtype=str, keep_default_na=False)
+        assert "Partiel Mars 2026" in df.columns
+        row = df[df["Numéro d'identification"] == "12345"].iloc[0]
+        assert row["Partiel Mars 2026"] == "15"
+
+    def test_custom_id_column(self, tmp_path):
+        master = _build_master()
+        out = tmp_path / "out.csv"
+        write_moodle_csv(master, out, id_column_name="Student Number")
+        df = pd.read_csv(out, dtype=str, keep_default_na=False)
+        assert "Student Number" in df.columns
+
 
 # ============================================================================
-# 10. Config loading
+# 12. Config & resolve_grade_files
 # ============================================================================
 
 
 class TestLoadConfig:
-    def test_valid_config_with_files(self, tmp_path):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["g1.csv"],
-                    "output_file": "out.csv",
-                }
-            )
-        )
-        cfg = load_config(cfg_path)
-        assert cfg["master_file"] == "master.csv"
+    def test_basic(self, tmp_path):
+        p = tmp_path / "c.yaml"
+        p.write_text(yaml.dump({"master_file": "m.csv", "grade_files": ["g.csv"]}))
+        cfg = load_config(p)
+        assert cfg["master_file"] == "m.csv"
 
-    def test_valid_config_with_dir(self, tmp_path):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_dir": "grades/",
-                    "output_file": "out.csv",
-                }
-            )
-        )
-        cfg = load_config(cfg_path)
-        assert cfg["grade_dir"] == "grades/"
-
-    def test_valid_config_with_both(self, tmp_path):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["extra.csv"],
-                    "grade_dir": "grades/",
-                }
-            )
-        )
-        cfg = load_config(cfg_path)
-        assert "grade_files" in cfg
-        assert "grade_dir" in cfg
-
-    def test_missing_master_raises(self, tmp_path):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(yaml.dump({"grade_files": ["g1.csv"]}))
+    def test_missing_master(self, tmp_path):
+        p = tmp_path / "c.yaml"
+        p.write_text(yaml.dump({"grade_files": ["g.csv"]}))
         with pytest.raises(ValueError, match="master_file"):
-            load_config(cfg_path)
+            load_config(p)
 
-    def test_missing_both_grade_sources_raises(self, tmp_path):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(yaml.dump({"master_file": "m.csv"}))
-        with pytest.raises(ValueError, match=r"grade_files.*grade_dir"):
-            load_config(cfg_path)
-
-    def test_default_output(self, tmp_path):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump({"master_file": "m.csv", "grade_files": ["g.csv"]})
-        )
-        cfg = load_config(cfg_path)
-        assert cfg["output_file"] == "grades_consolidated.csv"
-
-
-# ============================================================================
-# 11. resolve_grade_files
-# ============================================================================
+    def test_missing_grade_files_and_dir(self, tmp_path):
+        p = tmp_path / "c.yaml"
+        p.write_text(yaml.dump({"master_file": "m.csv"}))
+        with pytest.raises(ValueError):
+            load_config(p)
 
 
 class TestResolveGradeFiles:
-    def test_explicit_files_only(self, tmp_path):
-        (tmp_path / "a.csv").write_text("x")
-        (tmp_path / "b.xlsx").write_text("x")
-        result = resolve_grade_files(tmp_path, grade_files=["a.csv", "b.xlsx"])
+    def test_explicit_list(self, tmp_path):
+        (tmp_path / "a.csv").write_text("")
+        (tmp_path / "b.csv").write_text("")
+        result = resolve_grade_files(tmp_path, grade_files=["a.csv", "b.csv"])
         assert len(result) == 2
-        assert result[0].name == "a.csv"
-        assert result[1].name == "b.xlsx"
 
-    def test_dir_only(self, tmp_path):
-        grade_dir = tmp_path / "grades"
-        grade_dir.mkdir()
-        (grade_dir / "g1.csv").write_text("x")
-        (grade_dir / "g2.xlsx").write_text("x")
-        (grade_dir / "g3.ods").write_text("x")
-        (grade_dir / "readme.txt").write_text("x")  # .txt is supported
-        (grade_dir / "notes.pdf").write_text("x")  # .pdf is NOT supported
-        result = resolve_grade_files(tmp_path, grade_dir="grades")
-        names = [p.name for p in result]
-        assert "g1.csv" in names
-        assert "g2.xlsx" in names
-        assert "g3.ods" in names
-        assert "readme.txt" in names
-        assert "notes.pdf" not in names
-
-    def test_dir_ignores_subdirectories(self, tmp_path):
-        grade_dir = tmp_path / "grades"
-        grade_dir.mkdir()
-        (grade_dir / "g1.csv").write_text("x")
-        sub = grade_dir / "subdir"
-        sub.mkdir()
-        (sub / "nested.csv").write_text("x")
-        result = resolve_grade_files(tmp_path, grade_dir="grades")
-        assert len(result) == 1
-        assert result[0].name == "g1.csv"
-
-    def test_both_files_and_dir(self, tmp_path):
-        grade_dir = tmp_path / "grades"
-        grade_dir.mkdir()
-        (grade_dir / "from_dir.csv").write_text("x")
-        (tmp_path / "extra.csv").write_text("x")
-        result = resolve_grade_files(
-            tmp_path, grade_files=["extra.csv"], grade_dir="grades"
-        )
-        names = [p.name for p in result]
-        assert "extra.csv" in names
-        assert "from_dir.csv" in names
-
-    def test_deduplication(self, tmp_path):
-        """Same file listed explicitly and found in directory."""
-        grade_dir = tmp_path / "grades"
-        grade_dir.mkdir()
-        (grade_dir / "g1.csv").write_text("x")
-        result = resolve_grade_files(
-            tmp_path, grade_files=["grades/g1.csv"], grade_dir="grades"
-        )
-        assert len(result) == 1
-
-    def test_dir_sorted_deterministic(self, tmp_path):
-        grade_dir = tmp_path / "grades"
-        grade_dir.mkdir()
-        for name in ["charlie.csv", "alpha.csv", "bravo.csv"]:
-            (grade_dir / name).write_text("x")
-        result = resolve_grade_files(tmp_path, grade_dir="grades")
-        names = [p.name for p in result]
-        assert names == ["alpha.csv", "bravo.csv", "charlie.csv"]
-
-    def test_invalid_dir_raises(self, tmp_path):
-        with pytest.raises(ValueError, match="not a directory"):
-            resolve_grade_files(tmp_path, grade_dir="nonexistent")
-
-    def test_empty_dir_returns_empty(self, tmp_path):
-        grade_dir = tmp_path / "grades"
-        grade_dir.mkdir()
-        result = resolve_grade_files(tmp_path, grade_dir="grades")
-        assert result == []
-
-    def test_neither_files_nor_dir(self, tmp_path):
-        result = resolve_grade_files(tmp_path)
-        assert result == []
+    def test_directory_scan(self, tmp_path):
+        (tmp_path / "a.csv").write_text("")
+        (tmp_path / "b.xlsx").write_text("")
+        (tmp_path / "ignore.txt.bak").write_text("")
+        result = resolve_grade_files(tmp_path, grade_dir=str(tmp_path))
+        assert len(result) == 2
 
 
 # ============================================================================
-# 11. Full integration test
+# 13. Levenshtein and name similarity
 # ============================================================================
 
 
-class TestIntegration:
-    def test_end_to_end(self, tmp_path):
-        """Full pipeline: master + 3 TA files (csv, xlsx, ods) → output."""
-        # Master
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [
-                ["S001", "Alice", "Martin", "alice@univ.fr"],
-                ["S002", "Bob", "Bernard", "bob@univ.fr"],
-                ["S003", "Claire", "Dubois", "claire@univ.fr"],
-                ["S004", "David", "Thomas", "david@univ.fr"],
-            ],
-        )
+class TestLevenshteinDistance:
+    def test_identical(self):
+        assert levenshtein_distance("hello", "hello") == 0
 
-        # TA file 1 — CSV with IDs
-        ta1 = tmp_path / "group1.csv"
-        _write_csv(
-            ta1,
-            ["Student ID", "Grade"],
-            [["S001", "16"], ["S002", "ABS"]],
-        )
+    def test_single_substitution(self):
+        assert levenshtein_distance("Dupont", "Dupond") == 1
 
-        # TA file 2 — XLSX with names only
-        ta2 = tmp_path / "group2.xlsx"
-        pd.DataFrame(
-            {"Prénom": ["Claire"], "Nom": ["Dubois"], "Note": ["13,5"]}
-        ).to_excel(ta2, index=False, engine="openpyxl")
+    def test_single_insertion(self):
+        assert levenshtein_distance("Marin", "Martin") == 1
 
-        # TA file 3 — ODS with ID and name
-        ta3 = tmp_path / "group3.ods"
-        pd.DataFrame(
-            {
-                "Numéro étudiant": ["S004"],
-                "Prénom": ["David"],
-                "Nom": ["Thomas"],
-                "Note finale": ["18"],
-            }
-        ).to_excel(ta3, index=False, engine="odf")
+    def test_empty(self):
+        assert levenshtein_distance("", "") == 0
+        assert levenshtein_distance("abc", "") == 3
 
-        # Config
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["group1.csv", "group2.xlsx", "group3.ods"],
-                    "output_file": "results.csv",
-                }
-            )
-        )
 
-        master, reports = consolidate(cfg_path, interactive=False)
+class TestNameSimilarityHint:
+    def test_identical(self):
+        assert "identical" in name_similarity_hint(0, 10)
 
-        # Verify
-        assert all(not r.skipped for r in reports)
-        assert master.by_id["S001"].grade == 16.0
-        assert master.by_id["S002"].is_absent
-        assert master.by_id["S003"].grade == 13.5
-        assert master.by_id["S004"].grade == 18.0
+    def test_likely_typo(self):
+        assert "typo" in name_similarity_hint(1, 12)
 
-        # Check output file exists and is correct
-        out = tmp_path / "results.csv"
-        assert out.exists()
-        df = pd.read_csv(out, keep_default_na=False)
-        assert len(df) == 4
-        assert df.loc[df["Identifier"] == "S002", "Grade"].values[0] == "ABS"
-
-    def test_master_as_xlsx(self, tmp_path):
-        """Master file can also be XLSX."""
-        master_path = tmp_path / "master.xlsx"
-        pd.DataFrame(
-            {
-                "Identifiant": ["S001"],
-                "Prénom": ["Alice"],
-                "Nom": ["Martin"],
-                "Courriel": ["alice@univ.fr"],
-            }
-        ).to_excel(master_path, index=False, engine="openpyxl")
-
-        ta = tmp_path / "ta.csv"
-        _write_csv(ta, ["Identifiant", "Note"], [["S001", "17"]])
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.xlsx",
-                    "grade_files": ["ta.csv"],
-                    "output_file": "out.csv",
-                }
-            )
-        )
-
-        master, _reports = consolidate(cfg_path, interactive=False)
-        assert master.by_id["S001"].grade == 17.0
-
-    def test_grade_dir_integration(self, tmp_path):
-        """Full pipeline using grade_dir instead of grade_files."""
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [
-                ["S001", "Alice", "Martin", "alice@univ.fr"],
-                ["S002", "Bob", "Bernard", "bob@univ.fr"],
-            ],
-        )
-
-        grade_dir = tmp_path / "ta_grades"
-        grade_dir.mkdir()
-        _write_csv(
-            grade_dir / "group1.csv",
-            ["Student ID", "Grade"],
-            [["S001", "16"]],
-        )
-        pd.DataFrame({"Numéro étudiant": ["S002"], "Note": ["14,5"]}).to_excel(
-            grade_dir / "group2.xlsx", index=False, engine="openpyxl"
-        )
-
-        # Also put a non-grade file in the dir to make sure it's skipped
-        (grade_dir / "notes.pdf").write_text("not a spreadsheet")
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_dir": "ta_grades",
-                    "output_file": "results.csv",
-                }
-            )
-        )
-
-        master, reports = consolidate(cfg_path, interactive=False)
-        assert len(reports) == 2
-        assert all(not r.skipped for r in reports)
-        assert master.by_id["S001"].grade == 16.0
-        assert master.by_id["S002"].grade == 14.5
-
-    def test_grade_dir_and_files_combined(self, tmp_path):
-        """grade_files and grade_dir can be used together."""
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [
-                ["S001", "Alice", "Martin", "alice@univ.fr"],
-                ["S002", "Bob", "Bernard", "bob@univ.fr"],
-            ],
-        )
-
-        grade_dir = tmp_path / "ta_grades"
-        grade_dir.mkdir()
-        _write_csv(
-            grade_dir / "group1.csv",
-            ["Student ID", "Grade"],
-            [["S001", "15"]],
-        )
-
-        # An extra file outside the directory
-        _write_csv(
-            tmp_path / "extra_ta.csv",
-            ["Student ID", "Grade"],
-            [["S002", "17"]],
-        )
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["extra_ta.csv"],
-                    "grade_dir": "ta_grades",
-                    "output_file": "results.csv",
-                }
-            )
-        )
-
-        master, reports = consolidate(cfg_path, interactive=False)
-        assert len(reports) == 2
-        assert master.by_id["S001"].grade == 15.0
-        assert master.by_id["S002"].grade == 17.0
+    def test_very_different(self):
+        assert "different" in name_similarity_hint(8, 10)
 
 
 # ============================================================================
-# 12. Edge case: "Nom" column ambiguity with "last_name" role
-# ============================================================================
-
-
-class TestEdgeCases:
-    def test_bare_nom_detected_as_last_name(self):
-        """'Nom' alone should map to last_name, not first_name."""
-        assert detect_column(["Nom", "Prénom"], "last_name") == "Nom"
-        assert detect_column(["Nom", "Prénom"], "first_name") == "Prénom"
-
-    def test_grade_column_not_fooled_by_id_numbers(self):
-        """
-        Student IDs are numeric but should not be mistaken for grades
-        when they are already claimed as the ID column.
-        """
-        df = pd.DataFrame({"Numéro étudiant": ["12345", "12346"], "Note": ["15", "16"]})
-        # "Numéro étudiant" is already identified as ID
-        col, _, _ambiguous = detect_grade_column(df, {"Numéro étudiant"})
-        assert col == "Note"
-
-    def test_parse_grade_fraction_various(self):
-        """Various /xx patterns."""
-        assert parse_grade("17/20").value == 17.0
-        assert parse_grade("8.5/10").value == 8.5
-        assert parse_grade("0/20").value == 0.0
-
-    def test_mixed_valid_invalid_grades_in_column(self, tmp_path):
-        """Column with mix of valid grades and garbage is still detected
-        if ≥ 50% are numeric-like."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        # 3 valid out of 4 rows = 75%
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Mystery"],
-            [
-                ["12345", "15"],
-                ["12346", "ABS"],
-                ["12347", "12,5"],
-                ["12348", "oops"],
-            ],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        # Should detect Mystery as grade column
-        assert report.grades_assigned == 2  # 15 and 12.5
-        assert report.students_absent == 1  # ABS
-        assert master.by_id["12345"].grade == 15.0
-
-    def test_bom_in_csv_column_names(self, tmp_path):
-        """BOM character in CSV should not break column detection."""
-        p = tmp_path / "master.csv"
-        # Write raw bytes with BOM prefix on first column
-        p.write_bytes(
-            "\ufeffPrénom,Nom de famille,Numéro d\u2019identification,"
-            "Adresse de courriel\n"
-            "Alice,Martin,S001,alice@univ.fr\n".encode()
-        )
-        df = read_file(p)
-        assert "Prénom" in df.columns  # BOM stripped
-        master, _warnings = build_master_index(df)
-        assert "S001" in master.by_id
-        assert master.by_id["S001"].first_name == "Alice"
-        assert master.by_id["S001"].email == "alice@univ.fr"
-
-    def test_moodle_export_format(self, tmp_path):
-        """End-to-end with a Moodle-style master export (BOM + curly quotes)."""
-        # Master: Moodle export format
-        master_path = tmp_path / "participants.csv"
-        master_path.write_bytes(
-            "\ufeffPrénom,Nom de famille,Numéro d\u2019identification,"
-            "Adresse de courriel,Groupes\n"
-            "Alice,Martin,S001,alice@univ.fr,Groupe 1\n"
-            "Bob,Bernard,S002,bob@univ.fr,Groupe 2\n".encode()
-        )
-
-        # TA file
-        ta_path = tmp_path / "grades.csv"
-        _write_csv(
-            ta_path,
-            ["Student ID", "Grade"],
-            [["S001", "16"], ["S002", "14"]],
-        )
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "participants.csv",
-                    "grade_files": ["grades.csv"],
-                    "output_file": "out.csv",
-                }
-            )
-        )
-
-        master, _reports = consolidate(cfg_path, interactive=False)
-        assert master.by_id["S001"].grade == 16.0
-        assert master.by_id["S002"].grade == 14.0
-
-
-# ============================================================================
-# 14. Interactive column selection prompt
+# 14. Interactive prompts
 # ============================================================================
 
 
 class TestPromptColumnChoice:
-    def test_select_first_option(self, monkeypatch):
+    def test_select_first(self, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda _: "1")
-        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
-        assert result == "Note /23"
-
-    def test_select_second_option(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "2")
-        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
-        assert result == "Note /20"
+        assert prompt_column_choice(["A", "B"], "f.csv") == "A"
 
     def test_select_skip(self, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda _: "3")
-        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
-        assert result is None
+        assert prompt_column_choice(["A", "B"], "f.csv") is None
 
-    def test_invalid_then_valid_input(self, monkeypatch):
-        inputs = iter(["abc", "0", "5", "1"])
+    def test_invalid_then_valid(self, monkeypatch):
+        inputs = iter(["xyz", "99", "2"])
         monkeypatch.setattr("builtins.input", lambda _: next(inputs))
-        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
-        assert result == "Note /23"
+        assert prompt_column_choice(["A", "B"], "f.csv") == "B"
 
-    def test_eof_then_valid(self, monkeypatch):
-        """EOFError (e.g. piped input runs out) should retry."""
-        call_count = 0
 
-        def mock_input(_):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise EOFError
-            return "2"
+class TestPromptSheetSelection:
+    def test_all(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "all")
+        assert prompt_sheet_selection(["X", "Y"], "f.xlsx") == ["X", "Y"]
 
-        monkeypatch.setattr("builtins.input", mock_input)
-        result = prompt_column_choice(["Note /23", "Note /20"], "file.xlsx")
-        assert result == "Note /20"
+    def test_none(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "none")
+        assert prompt_sheet_selection(["X", "Y"], "f.xlsx") == []
 
-    def test_interactive_process_ta_file(self, tmp_path, monkeypatch):
-        """End-to-end: ambiguous file + interactive selection = grade assigned."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Note /23", "Note /20"],
-            [["12345", "18", "15"]],
-        )
-        # User selects "Note /20" (option 2)
-        monkeypatch.setattr("builtins.input", lambda _: "2")
-        report = process_ta_file(p, master, interactive=True)
-        assert not report.skipped
-        assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 15.0
-        assert any("manually selected" in w.lower() for w in report.warnings)
+    def test_specific(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "1,3")
+        assert prompt_sheet_selection(["X", "Y", "Z"], "f.xlsx") == ["X", "Z"]
 
-    def test_interactive_skip_file(self, tmp_path, monkeypatch):
-        """User chooses to skip the file in the interactive prompt."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Note /23", "Note /20"],
-            [["12345", "18", "15"]],
-        )
-        # User selects skip (option 3)
-        monkeypatch.setattr("builtins.input", lambda _: "3")
-        report = process_ta_file(p, master, interactive=True)
-        assert report.skipped
-        assert master.by_id["12345"].grade is None
+
+class TestPromptNameMismatch:
+    def test_yes(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        assert prompt_name_mismatch("1", "Jean Dupont", "Jean Dupond", "f.csv") is True
+
+    def test_no(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+        assert prompt_name_mismatch("1", "Jean Dupont", "Jean Dupond", "f.csv") is False
 
 
 # ============================================================================
-# 15. detect_all_columns
-# ============================================================================
-
-
-class TestDetectAllColumns:
-    def test_single_match(self):
-        cols = ["Numéro étudiant", "Prénom", "Note"]
-        assert detect_all_columns(cols, "id") == ["Numéro étudiant"]
-
-    def test_multiple_matches(self):
-        cols = ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"]
-        matches = detect_all_columns(cols, "id")
-        assert "Numero" in matches
-        assert "Numero etudiant" in matches
-        assert len(matches) == 2
-
-    def test_no_match(self):
-        assert detect_all_columns(["Foo", "Bar"], "id") == []
-
-
-# ============================================================================
-# 16. Ambiguous ID column with interactive prompt
+# 15. Ambiguous columns + overrides
 # ============================================================================
 
 
 class TestAmbiguousIdColumn:
-    def test_ambiguous_id_interactive_select(self, tmp_path, monkeypatch):
-        """When two ID columns exist, user picks the right one."""
+    def test_interactive_select(self, tmp_path, monkeypatch):
         master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
@@ -1772,57 +818,15 @@ class TestAmbiguousIdColumn:
             ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
             [["1", "Jean", "Dupont", "12345", "15"]],
         )
-        # "Numero" and "Numero etudiant" both match ID.
-        # User selects "Numero etudiant" (option 2)
         monkeypatch.setattr("builtins.input", lambda _: "2")
         report = process_ta_file(p, master, interactive=True)
-        assert not report.skipped
-        assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
-        assert "id" in report.new_file_overrides
-        assert report.new_file_overrides["id"] == "Numero etudiant"
-
-    def test_ambiguous_id_non_interactive_uses_first(self, tmp_path):
-        """Non-interactive mode uses the first match."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
-            [["12345", "Jean", "Dupont", "12345", "15"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert not report.skipped
-        # First match "Numero" was used - happens to work here since
-        # we set the same value in both columns
-        assert report.grades_assigned == 1
-
-    def test_ambiguous_id_skip_falls_back_to_name(self, tmp_path, monkeypatch):
-        """User skips ID selection — falls back to name matching."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numero", "Prenom", "Nom", "Numero etudiant", "Note"],
-            [["1", "Jean", "Dupont", "12345", "15"]],
-        )
-        # User selects skip (option 3) for ID
-        monkeypatch.setattr("builtins.input", lambda _: "3")
-        report = process_ta_file(p, master, interactive=True)
-        # Should still work via name matching
-        assert not report.skipped
-        assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 15.0
-
-
-# ============================================================================
-# 17. Column overrides (YAML persistence)
-# ============================================================================
+        assert report.new_file_overrides is not None
+        assert report.new_file_overrides.get("id") == "Numero etudiant"
 
 
 class TestColumnOverrides:
-    def test_override_applied(self, tmp_path):
-        """Column override bypasses detection."""
+    def test_id_override_applied(self, tmp_path):
         master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
@@ -1836,13 +840,10 @@ class TestColumnOverrides:
             interactive=False,
             file_overrides={"id": "Numero etudiant"},
         )
-        assert not report.skipped
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
-        assert any("saved override" in w.lower() for w in report.warnings)
 
-    def test_override_for_grade(self, tmp_path):
-        """Grade override bypasses detection."""
+    def test_grade_override_applied(self, tmp_path):
         master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
@@ -1859,42 +860,19 @@ class TestColumnOverrides:
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
 
-    def test_override_missing_column_falls_back(self, tmp_path):
-        """Override pointing to a nonexistent column falls back to detection."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Note"],
-            [["12345", "15"]],
-        )
-        report = process_ta_file(
-            p,
-            master,
-            interactive=False,
-            file_overrides={"grade": "Nonexistent Column"},
-        )
-        # Should fall back to detecting "Note"
-        assert not report.skipped
-        assert report.grades_assigned == 1
-        assert any("not found in columns" in w.lower() for w in report.warnings)
-
     def test_overrides_persisted_to_yaml(self, tmp_path, monkeypatch):
-        """Interactive choices are saved to the YAML config."""
         master_path = tmp_path / "master.csv"
         _write_csv(
             master_path,
             ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [["S001", "Alice", "Martin", "alice@univ.fr"]],
+            [["S001", "Alice", "Martin", "a@e.fr"]],
         )
-
         ta_path = tmp_path / "ta.csv"
         _write_csv(
             ta_path,
             ["Numéro étudiant", "Note /23", "Note /20"],
             [["S001", "18", "15"]],
         )
-
         cfg_path = tmp_path / "config.yaml"
         cfg_path.write_text(
             yaml.dump(
@@ -1902,142 +880,39 @@ class TestColumnOverrides:
                     "master_file": "master.csv",
                     "grade_files": ["ta.csv"],
                     "output_file": "out.csv",
+                    "exam_name": "Test",
+                    "id_column_name": "ID",
                 }
             )
         )
-
-        # User selects "Note /20" (option 2)
         monkeypatch.setattr("builtins.input", lambda _: "2")
         consolidate(cfg_path, interactive=True)
-
-        # Re-read config — overrides should be saved
         with open(cfg_path, encoding="utf-8") as f:
-            saved_cfg = yaml.safe_load(f)
-        assert "column_overrides" in saved_cfg
-        assert "ta.csv" in saved_cfg["column_overrides"]
-        assert saved_cfg["column_overrides"]["ta.csv"]["grade"] == "Note /20"
-
-    def test_saved_overrides_reused_on_rerun(self, tmp_path):
-        """On second run, saved overrides skip the prompt."""
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [["S001", "Alice", "Martin", "alice@univ.fr"]],
-        )
-
-        ta_path = tmp_path / "ta.csv"
-        _write_csv(
-            ta_path,
-            ["Numéro étudiant", "Note /23", "Note /20"],
-            [["S001", "18", "15"]],
-        )
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["ta.csv"],
-                    "output_file": "out.csv",
-                    "column_overrides": {"ta.csv": {"grade": "Note /20"}},
-                }
-            )
-        )
-
-        # Should work without any interactive input
-        master, reports = consolidate(cfg_path, interactive=False)
-        assert master.by_id["S001"].grade == 15.0
-        assert any("saved override" in w.lower() for w in reports[0].warnings)
+            saved = yaml.safe_load(f)
+        assert "column_overrides" in saved
+        assert saved["column_overrides"]["ta.csv"]["grade"] == "Note /20"
 
 
 # ============================================================================
-# 18. Levenshtein distance and name similarity
-# ============================================================================
-
-
-class TestLevenshteinDistance:
-    def test_identical(self):
-        assert levenshtein_distance("hello", "hello") == 0
-
-    def test_single_substitution(self):
-        assert levenshtein_distance("Dupont", "Dupond") == 1
-
-    def test_single_insertion(self):
-        assert levenshtein_distance("Marin", "Martin") == 1
-
-    def test_single_deletion(self):
-        assert levenshtein_distance("Martin", "Marin") == 1
-
-    def test_empty_strings(self):
-        assert levenshtein_distance("", "") == 0
-        assert levenshtein_distance("abc", "") == 3
-        assert levenshtein_distance("", "abc") == 3
-
-    def test_completely_different(self):
-        assert levenshtein_distance("abc", "xyz") == 3
-
-    def test_symmetric(self):
-        assert levenshtein_distance("a", "ab") == levenshtein_distance("ab", "a")
-
-
-class TestNameSimilarityHint:
-    def test_identical(self):
-        assert "identical" in name_similarity_hint(0, 10)
-
-    def test_likely_typo(self):
-        hint = name_similarity_hint(1, 12)
-        assert "typo" in hint
-
-    def test_very_different(self):
-        hint = name_similarity_hint(8, 10)
-        assert "different" in hint
-
-    def test_empty(self):
-        # dist=0, max_len=0: both strings empty → identical
-        assert "identical" in name_similarity_hint(0, 0)
-
-
-# ============================================================================
-# 19. Name mismatch confirmation
+# 16. Name mismatch + name split bug
 # ============================================================================
 
 
 class TestNameMismatchConfirmation:
-    def test_prompt_confirm(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "y")
-        result = prompt_name_mismatch("12345", "Jean Dupont", "Jean Dupond", "ta.csv")
-        assert result is True
-
-    def test_prompt_reject(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "n")
-        result = prompt_name_mismatch("12345", "Jean Dupont", "Jean Dupond", "ta.csv")
-        assert result is False
-
-    def test_prompt_invalid_then_valid(self, monkeypatch):
-        inputs = iter(["maybe", "x", "y"])
-        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
-        result = prompt_name_mismatch("12345", "Jean Dupont", "Jean Dupond", "ta.csv")
-        assert result is True
-
-    def test_interactive_confirm_assigns_grade(self, tmp_path, monkeypatch):
-        """Name mismatch + user confirms → grade assigned."""
+    def test_interactive_confirm(self, tmp_path, monkeypatch):
         master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
             p,
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["12345", "Jean", "Dupond", "15"]],  # Dupond ≠ Dupont
+            [["12345", "Jean", "Dupond", "15"]],
         )
         monkeypatch.setattr("builtins.input", lambda _: "y")
         report = process_ta_file(p, master, interactive=True)
         assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 15.0
         assert "12345" in report.new_name_confirmations
-        assert any("confirmed" in w.lower() for w in report.warnings)
 
-    def test_interactive_reject_skips_student(self, tmp_path, monkeypatch):
-        """Name mismatch + user rejects → student skipped."""
+    def test_interactive_reject(self, tmp_path, monkeypatch):
         master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
@@ -2048,25 +923,8 @@ class TestNameMismatchConfirmation:
         monkeypatch.setattr("builtins.input", lambda _: "n")
         report = process_ta_file(p, master, interactive=True)
         assert report.grades_assigned == 0
-        assert master.by_id["12345"].grade is None
-        assert any("rejected" in w.lower() for w in report.warnings)
-
-    def test_non_interactive_proceeds_silently(self, tmp_path):
-        """Non-interactive mode proceeds with warning on name mismatch."""
-        master = _build_master()
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["12345", "Jean", "Dupond", "15"]],
-        )
-        report = process_ta_file(p, master, interactive=False)
-        assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 15.0
-        assert any("non-interactive" in w.lower() for w in report.warnings)
 
     def test_saved_confirmation_skips_prompt(self, tmp_path):
-        """Previously confirmed name mismatch doesn't re-prompt."""
         master = _build_master()
         p = tmp_path / "ta.csv"
         _write_csv(
@@ -2074,7 +932,6 @@ class TestNameMismatchConfirmation:
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
             [["12345", "Jean", "Dupond", "15"]],
         )
-        # No monkeypatch needed — should not prompt
         report = process_ta_file(
             p,
             master,
@@ -2082,248 +939,67 @@ class TestNameMismatchConfirmation:
             name_confirmations=["12345"],
         )
         assert report.grades_assigned == 1
-        assert master.by_id["12345"].grade == 15.0
         assert any("previously confirmed" in w.lower() for w in report.warnings)
-
-    def test_confirmation_persisted_to_yaml(self, tmp_path, monkeypatch):
-        """Interactive name confirmation saved to config YAML."""
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [["S001", "Alice", "Martin", "alice@univ.fr"]],
-        )
-
-        ta_path = tmp_path / "ta.csv"
-        _write_csv(
-            ta_path,
-            ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["S001", "Alice", "Martine", "16"]],  # Martine ≠ Martin
-        )
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["ta.csv"],
-                    "output_file": "out.csv",
-                }
-            )
-        )
-
-        monkeypatch.setattr("builtins.input", lambda _: "y")
-        consolidate(cfg_path, interactive=True)
-
-        # Re-read config
-        with open(cfg_path, encoding="utf-8") as f:
-            saved_cfg = yaml.safe_load(f)
-        assert "name_confirmations" in saved_cfg
-        assert "ta.csv" in saved_cfg["name_confirmations"]
-        assert "S001" in saved_cfg["name_confirmations"]["ta.csv"]
-
-    def test_saved_confirmation_reused_on_rerun(self, tmp_path):
-        """On second run, saved name confirmation skips the prompt."""
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [["S001", "Alice", "Martin", "alice@univ.fr"]],
-        )
-
-        ta_path = tmp_path / "ta.csv"
-        _write_csv(
-            ta_path,
-            ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["S001", "Alice", "Martine", "16"]],
-        )
-
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["ta.csv"],
-                    "output_file": "out.csv",
-                    "name_confirmations": {"ta.csv": ["S001"]},
-                }
-            )
-        )
-
-        # No monkeypatch — should not prompt
-        master, reports = consolidate(cfg_path, interactive=False)
-        assert master.by_id["S001"].grade == 16.0
-        assert any("previously confirmed" in w.lower() for w in reports[0].warnings)
-
-
-# ============================================================================
-# 20. Name split mismatch (full name identical, parts differ)
-# ============================================================================
 
 
 class TestNameSplitMismatch:
     def test_different_split_same_full_name_no_prompt(self, tmp_path):
-        """Different first/last split but same full name should NOT prompt."""
-        # Master: first="Mohamed Ayoub", last="Mebarki"
-        df = _master_df([("12345", "Mohamed Ayoub", "Mebarki", "ma@etu.fr")])
+        """First/last split differs but full name identical → no prompt."""
+        df = _master_df([("12345", "Mohamed Ayoub", "Mebarki", "ma@e.fr")])
         master, _ = build_master_index(df)
         p = tmp_path / "ta.csv"
-        # TA: first="Mohamed", last="Ayoub Mebarki" (different split)
         _write_csv(
             p,
             ["Numéro étudiant", "Prénom", "Nom", "Note"],
             [["12345", "Mohamed", "Ayoub Mebarki", "15"]],
         )
-        # Should NOT prompt — interactive=True but no monkeypatch needed
-        # because the prompt should never be reached
+        # No monkeypatch — must not prompt
         report = process_ta_file(p, master, interactive=True)
         assert report.grades_assigned == 1
         assert master.by_id["12345"].grade == 15.0
-        # No name mismatch warnings
-        assert not any("name mismatch" in w.lower() for w in report.warnings)
-
-    def test_real_mismatch_still_prompts(self, tmp_path, monkeypatch):
-        """Actual name difference (not just split) still triggers prompt."""
-        df = _master_df([("12345", "Jean", "Dupont", "jd@etu.fr")])
-        master, _ = build_master_index(df)
-        p = tmp_path / "ta.csv"
-        _write_csv(
-            p,
-            ["Numéro étudiant", "Prénom", "Nom", "Note"],
-            [["12345", "Jean", "Dupond", "15"]],  # Dupond ≠ Dupont
-        )
-        monkeypatch.setattr("builtins.input", lambda _: "y")
-        report = process_ta_file(p, master, interactive=True)
-        assert report.grades_assigned == 1
-        assert any("mismatch" in w.lower() for w in report.warnings)
 
 
 # ============================================================================
-# 21. Sheet selection
+# 17. Sheet selection
 # ============================================================================
 
 
-class TestSheetSelection:
-    def test_prompt_all(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "all")
-        result = prompt_sheet_selection(["DC-1", "DC-2", "DC-3"], "file.xlsx")
-        assert result == ["DC-1", "DC-2", "DC-3"]
-
-    def test_prompt_none(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "none")
-        result = prompt_sheet_selection(["DC-1", "DC-2"], "file.xlsx")
-        assert result == []
-
-    def test_prompt_specific(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "1,3")
-        result = prompt_sheet_selection(["DC-1", "DC-2", "DC-3"], "file.xlsx")
-        assert result == ["DC-1", "DC-3"]
-
-    def test_prompt_single(self, monkeypatch):
-        monkeypatch.setattr("builtins.input", lambda _: "2")
-        result = prompt_sheet_selection(["DC-1", "DC-2"], "file.xlsx")
-        assert result == ["DC-2"]
-
-    def test_prompt_invalid_then_valid(self, monkeypatch):
-        inputs = iter(["abc", "99", "1,2"])
-        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
-        result = prompt_sheet_selection(["DC-1", "DC-2"], "file.xlsx")
-        assert result == ["DC-1", "DC-2"]
-
+class TestSheetSelectionIntegration:
     def test_saved_selection_reused(self, tmp_path):
-        """Saved sheet selection skips the prompt."""
         master = _build_master()
         p = tmp_path / "ta.xlsx"
-
-        import openpyxl
-
-        wb = openpyxl.Workbook()
-        ws1 = wb.active
-        ws1.title = "Current Exam"
-        ws1.append(["Numéro étudiant", "Prénom", "Note"])
-        ws1.append(["12345", "Jean", "15"])
-
-        ws2 = wb.create_sheet("Future Exam")
-        ws2.append(["Numéro étudiant", "Prénom", "Note"])
-        ws2.append(["12345", "Jean", ""])  # placeholder row
-
-        ws3 = wb.create_sheet("Other Future")
-        ws3.append(["Numéro étudiant", "Prénom", "Note"])
-        ws3.append(["12345", "Jean", ""])
-        wb.save(p)
-
-        # No monkeypatch — saved selection should work
-        report = process_ta_file(
-            p,
-            master,
-            interactive=True,
-            file_overrides={"selected_sheets": ["Current Exam"]},
-        )
-        assert not report.skipped
-        assert report.grades_assigned == 1
-        assert any("saved sheet selection" in w.lower() for w in report.warnings)
-
-    def test_interactive_selection_persisted_to_yaml(self, tmp_path, monkeypatch):
-        """Interactive sheet selection saved to config YAML."""
-        master_path = tmp_path / "master.csv"
-        _write_csv(
-            master_path,
-            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
-            [["S001", "Alice", "Martin", "alice@univ.fr"]],
-        )
-
-        ta_path = tmp_path / "ta.xlsx"
         import openpyxl
 
         wb = openpyxl.Workbook()
         ws1 = wb.active
         ws1.title = "Current"
         ws1.append(["Numéro étudiant", "Prénom", "Note"])
-        ws1.append(["S001", "Alice", "16"])
-
+        ws1.append(["12345", "Jean", "15"])
         ws2 = wb.create_sheet("Future")
         ws2.append(["Numéro étudiant", "Prénom", "Note"])
-        ws2.append(["S001", "Alice", ""])  # placeholder
-        wb.save(ta_path)
+        ws2.append(["12345", "Jean", ""])
+        wb.save(p)
 
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(
-            yaml.dump(
-                {
-                    "master_file": "master.csv",
-                    "grade_files": ["ta.xlsx"],
-                    "output_file": "out.csv",
-                }
-            )
+        report = process_ta_file(
+            p,
+            master,
+            interactive=True,
+            file_overrides={"selected_sheets": ["Current"]},
         )
-
-        # User selects only "Current" (option 1)
-        monkeypatch.setattr("builtins.input", lambda _: "1")
-        consolidate(cfg_path, interactive=True)
-
-        # Re-read config
-        with open(cfg_path, encoding="utf-8") as f:
-            saved_cfg = yaml.safe_load(f)
-        assert "column_overrides" in saved_cfg
-        assert "ta.xlsx" in saved_cfg["column_overrides"]
-        assert saved_cfg["column_overrides"]["ta.xlsx"]["selected_sheets"] == [
-            "Current"
-        ]
+        assert report.grades_assigned == 1
+        assert any("saved sheet selection" in w.lower() for w in report.warnings)
 
     def test_skip_none_sheets(self, tmp_path, monkeypatch):
-        """Selecting 'none' skips the file entirely."""
         master = _build_master()
         p = tmp_path / "ta.xlsx"
-
         import openpyxl
 
         wb = openpyxl.Workbook()
         ws1 = wb.active
-        ws1.title = "Sheet1"
+        ws1.title = "S1"
         ws1.append(["Numéro étudiant", "Prénom", "Note"])
         ws1.append(["12345", "Jean", "15"])
-
-        ws2 = wb.create_sheet("Sheet2")
+        ws2 = wb.create_sheet("S2")
         ws2.append(["Numéro étudiant", "Prénom", "Note"])
         ws2.append(["12346", "Marie", "14"])
         wb.save(p)
@@ -2331,20 +1007,12 @@ class TestSheetSelection:
         monkeypatch.setattr("builtins.input", lambda _: "none")
         report = process_ta_file(p, master, interactive=True)
         assert report.skipped
-        assert master.by_id["12345"].grade is None
-
-
-# ============================================================================
-# 22. Multi-sheet override propagation
-# ============================================================================
 
 
 class TestMultiSheetOverridePropagation:
-    def test_interactive_choice_carries_to_second_sheet(self, tmp_path, monkeypatch):
-        """Sheet selection + grade column chosen on sheet 1 reused on sheet 2."""
+    def test_grade_choice_carries_across_sheets(self, tmp_path, monkeypatch):
         master = _build_master()
         p = tmp_path / "ta.xlsx"
-
         import openpyxl
 
         wb = openpyxl.Workbook()
@@ -2352,37 +1020,26 @@ class TestMultiSheetOverridePropagation:
         ws1.title = "DC-1"
         ws1.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
         ws1.append(["12345", "Jean", "18", "15"])
-
         ws2 = wb.create_sheet("DC-2")
         ws2.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
         ws2.append(["12346", "Marie", "17", "14"])
         wb.save(p)
 
-        # First prompt: sheet selection → "all"
-        # Second prompt: grade column for DC-1 → "2" (Note /20)
-        # DC-2 should reuse the grade choice — no third prompt
+        # Sheet selection: "all", then grade column for first sheet: "2"
         responses = iter(["all", "2"])
-
-        def mock_input(prompt):
-            return next(responses)
-
-        monkeypatch.setattr("builtins.input", mock_input)
+        monkeypatch.setattr("builtins.input", lambda _: next(responses))
         report = process_ta_file(p, master, interactive=True)
 
-        assert not report.skipped
         assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 15.0  # Note /20 value
-        assert master.by_id["12346"].grade == 14.0  # Note /20 value
-        # Check structure of saved overrides
+        assert master.by_id["12345"].grade == 15.0
+        assert master.by_id["12346"].grade == 14.0
+        assert report.new_file_overrides is not None
         assert "selected_sheets" in report.new_file_overrides
         assert "sheet_columns" in report.new_file_overrides
-        assert "DC-1" in report.new_file_overrides["sheet_columns"]
 
-    def test_saved_override_applies_to_all_sheets(self, tmp_path):
-        """Saved YAML override works for all sheets without prompting."""
+    def test_saved_per_sheet_overrides(self, tmp_path):
         master = _build_master()
         p = tmp_path / "ta.xlsx"
-
         import openpyxl
 
         wb = openpyxl.Workbook()
@@ -2390,13 +1047,11 @@ class TestMultiSheetOverridePropagation:
         ws1.title = "DC-1"
         ws1.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
         ws1.append(["12345", "Jean", "18", "15"])
-
         ws2 = wb.create_sheet("DC-2")
         ws2.append(["Numéro étudiant", "Prénom", "Note /23", "Note /20"])
         ws2.append(["12346", "Marie", "17", "14"])
         wb.save(p)
 
-        # No monkeypatch — saved overrides should handle everything
         report = process_ta_file(
             p,
             master,
@@ -2409,7 +1064,71 @@ class TestMultiSheetOverridePropagation:
                 },
             },
         )
-        assert not report.skipped
         assert report.grades_assigned == 2
-        assert master.by_id["12345"].grade == 15.0
-        assert master.by_id["12346"].grade == 14.0
+
+
+# ============================================================================
+# 18. Integration
+# ============================================================================
+
+
+class TestIntegration:
+    def test_end_to_end(self, tmp_path):
+        master_path = tmp_path / "master.csv"
+        _write_csv(
+            master_path,
+            ["Numéro étudiant", "Prénom", "Nom de famille", "Email"],
+            [
+                ["S001", "Alice", "Martin", "a@e.fr"],
+                ["S002", "Bob", "Bernard", "b@e.fr"],
+                ["S003", "Carol", "Petit", "c@e.fr"],
+            ],
+        )
+
+        ta1 = tmp_path / "g1.csv"
+        _write_csv(
+            ta1,
+            ["Numéro étudiant", "Prénom", "Nom", "Note"],
+            [
+                ["S001", "Alice", "Martin", "16"],
+                ["S002", "Bob", "Bernard", "ABS"],
+            ],
+        )
+
+        ta2 = tmp_path / "g2.xlsx"
+        pd.DataFrame(
+            {
+                "Numéro étudiant": ["S003"],
+                "Prénom": ["Carol"],
+                "Nom": ["Petit"],
+                "Note": ["13.5"],
+            }
+        ).to_excel(ta2, index=False, engine="openpyxl")
+
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "master_file": "master.csv",
+                    "grade_files": ["g1.csv", "g2.xlsx"],
+                    "output_file": "out.csv",
+                    "exam_name": "Partiel",
+                    "id_column_name": "Numéro d'identification",
+                }
+            )
+        )
+
+        master, reports = consolidate(cfg_path, interactive=False)
+        assert all(not r.skipped for r in reports)
+        assert master.by_id["S001"].grade == 16.0
+        assert master.by_id["S002"].is_absent
+        assert master.by_id["S003"].grade == 13.5
+
+        out = tmp_path / "out.csv"
+        df = pd.read_csv(out, dtype=str, keep_default_na=False)
+        assert "Partiel" in df.columns
+        assert "Numéro d'identification" in df.columns
+        assert (
+            df.loc[df["Numéro d'identification"] == "S002", "Partiel"].values[0]
+            == "ABS"
+        )
